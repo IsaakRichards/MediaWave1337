@@ -1,10 +1,10 @@
-# TorrentWave2000
+# MediaWave1337
 
 > **Turn torrent-sourced SD video releases into a real cable TV experience for CRT displays.**
 
 <img width="288" height="180" alt="Kapture 2026-06-14 at 21 13 51" src="https://github.com/user-attachments/assets/9cc72a69-b647-43a5-8338-ebb50590794f" />
 
-TorrentWave2000 is a fork of MediaWave2000 repurposed to stream videos via BitTorrent for playback on CRT-style displays (SD / 480i / 4:3). Instead of scanning local video directories, TorrentWave2000 obtains releases from local indexers (Jackett or Prowlarr), prefers CRT-friendly SD releases, and streams them using python-libtorrent with file-level piece prioritization for smoother linear playback.
+MediaWave1337 is a fork of MediaWave2000 repurposed to stream videos via BitTorrent for playback on CRT-style displays (SD / 480i / 4:3). Instead of scanning local video directories, MediaWave1337 obtains releases from local indexers (Jackett or Prowlarr), prefers CRT-friendly SD releases, and streams them using python-libtorrent with file-level piece prioritization for smoother linear playback.
 
 Put your channels (playlists) as XML files under `channels/`, let the loader populate magnet links from your local indexer, and let the streamer buffer and prioritize files so playback on low-resolution CRTs starts earlier and feels like real TV.
 
@@ -22,7 +22,7 @@ Put your channels (playlists) as XML files under `channels/`, let the loader pop
 
 ## What is this?
 
-TorrentWave2000 transforms curated video playback into a faux-cable experience targeted at CRT TVs. It keeps the channel/playlist model from the original MediaWave2000 but replaces local-folder scanning with indexed BitTorrent streaming so you can source releases from indexers while keeping playback order, scheduling, and ad breaks.
+MediaWave1337 transforms curated video playback into a faux-cable experience targeted at CRT TVs. It keeps the channel/playlist model from the original MediaWave2000 but replaces local-folder scanning with indexed BitTorrent streaming so you can source releases from indexers while keeping playback order, scheduling, and ad breaks.
 
 If you liked FieldStation42 or MediaWave2000's concept, but want a setup that can acquire and stream SD releases automatically (favoring older 480i/4:3 masters), this fork is built for that workflow.
 
@@ -85,7 +85,7 @@ Example sample channel included: `channels/twilight_zone.xml`.
 
 - Default providers: Jackett (tried first) and Prowlarr (fallback). API key handling matches common conventions (Jackett: `apikey` query param, Prowlarr: `X-Api-Key` header).
 - Category restriction: searches limited to SD TV (5030) and SD Movies (2030) to bias results toward CRT-appropriate releases.
-- Title scoring: positive weight for `480i`, `480p`, `DVDRip`, `SDTV`, `4:3` patterns; penalties for `1080p`, `4k`, `BluRay` and similar markers. The final candidate score = title_score * 10 + log(1 + seeders) so title-fit is prioritized and seeders break ties.
+- Title scoring: positive weight for `480i`, `480p`, `DVDRip`, `SDTV`, `4:3` patterns; penalties for `1080p`, `4k`, `BluRay` and similar markers. The final candidate score = title_score * 10 + log(...)
 
 ---
 
@@ -96,9 +96,9 @@ Example sample channel included: `channels/twilight_zone.xml`.
   - Waits for torrent metadata,
   - Attempts to locate the desired file inside the torrent (matching `save_path` suffix or falling back to single-file torrents),
   - Applies high file priority to that file and attempts to enable sequential download (if supported), to improve start-of-playback latency.
-- Buffering policy: the loader buffers the current channel, the one above it, and the one below it (by filename ordering) and fetches the next 3 episodes per channel. The streamer keeps only the configured buffer set active and evicts older torrents.
+- Buffering policy: the loader buffers the current channel, the one above it, and the one below it (by filename ordering) and fetches the next 3 episodes per channel. The streamer keeps only the current buffer set in active downloads to limit disk use.
 
-Limitations: piece-priority + sequential download improves linear playback but seeking arbitrarily still depends on pieces already downloaded; perfect random-access streaming would need more advanced piece control.
+Limitations: piece-priority + sequential download improves linear playback but seeking arbitrarily still depends on pieces already downloaded; perfect random-access streaming would need more advanced support.
 
 ---
 
@@ -187,6 +187,6 @@ Tell me your OS and Python version and I can give step-by-step instructions.
 
 This fork is based on MediaWave2000. Much of the original README content, screenshots, and ideas are preserved here with a new focus on torrent-sourced streaming for CRT-targeted playback.
 
-**NO copyrighted media is included with TorrentWave2000. Users must supply their own legally obtained media files.**
+**NO copyrighted media is included with MediaWave1337. Users must supply their own legally obtained media files.**
 
 *Tune in. Sit back. There's always something on.*
