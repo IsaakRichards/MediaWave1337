@@ -1,18 +1,12 @@
-# Welcome to MediaWave2000!
+# TorrentWave2000
 
-> **Turn your media library into a real cable TV experience.**
+> **Turn torrent-sourced SD video releases into a real cable TV experience for CRT displays.**
 
 <img width="288" height="180" alt="Kapture 2026-06-14 at 21 13 51" src="https://github.com/user-attachments/assets/9cc72a69-b647-43a5-8338-ebb50590794f" />
 
-Put your videos in folders, open MediaWave2000, and watch TV!
+TorrentWave2000 is a fork of MediaWave2000 repurposed to stream videos via BitTorrent for playback on CRT-style displays (SD / 480i / 4:3). Instead of scanning local video directories, TorrentWave2000 obtains releases from local indexers (Jackett or Prowlarr), prefers CRT-friendly SD releases, and streams them using python-libtorrent with file-level piece prioritization for smoother linear playback.
 
----
-
-## What is this?
-
-MediaWave2000 is a desktop app that transforms your local video collection into a fully functional fake cable channel system - complete with a scrollable TV guide, "On-Demand" Vault, scheduled programming, commercial breaks, and themed on-screen displays.
-
-If you've ever tried **FieldStation42** and wanted something simpler to easily turn your media catalog into a working cable system, this was made for you. MediaWave2000 sets itself up automatically from your folder structure. No configuring schedules, no .json files, just folders!
+Put your channels (playlists) as XML files under `channels/`, let the loader populate magnet links from your local indexer, and let the streamer buffer and prioritize files so playback on low-resolution CRTs starts earlier and feels like real TV.
 
 ---
 
@@ -26,181 +20,173 @@ If you've ever tried **FieldStation42** and wanted something simpler to easily t
 
 ---
 
-## Features
+## What is this?
 
-See [FEATURES.md](FEATURES.md) for the full list, but here's the basics:
+TorrentWave2000 transforms curated video playback into a faux-cable experience targeted at CRT TVs. It keeps the channel/playlist model from the original MediaWave2000 but replaces local-folder scanning with indexed BitTorrent streaming so you can source releases from indexers while keeping playback order, scheduling, and ad breaks.
 
-- **Scrollable TV Guide** — browse your lineup like the old digital cable you know and love!
-- **The Vault** — on-demand section, like a local streaming library
-- **Auto-scheduling** — point it at a folder, it builds a channel. No config required.
-- **Commercial system** — plays ad breaks between episodes or on a timer
-- **Three visual themes** — 80s set-top box, mid-2000s "Promised Future," and modernized "Sleek Freak" — each with multiple color variants
-- **Channel logos** — custom watermark per channel, with position and size control, timing, opacity and grayscale options
-- **Companion channels** — WeatherStar connectivity, RadioWave TV (music visualizer), NetTV (YouTube playlists)
-- **MediaWave Converter** — companion app to batch-prep files for smooth playback
-- Works on **Mac**, **Windows**, and in the future, Linux.
-- More always being worked on!
+If you liked FieldStation42 or MediaWave2000's concept, but want a setup that can acquire and stream SD releases automatically (favoring older 480i/4:3 masters), this fork is built for that workflow.
 
 ---
 
-## Getting Started
+## Features (high level)
 
-### 1. Organize your media
+- Channel playlists: one XML file per channel under `channels/` (playback order preserved)
+- Indexer integration: query Jackett or Prowlarr REST APIs to find magnet links
+- CRT-first release selection: automatic scoring that prefers `480i`, `480p`, `DVDRip`, `SDTV`, and `4:3`, and penalizes HD/BluRay tags
+- Category restriction: searches limited to SD TV (5030) and SD Movies (2030) by default
+- libtorrent streaming with file-priority: prioritize the intended file inside a torrent and enable sequential download for smoother linear playback
+- Buffering: automatic buffer for the current channel plus the previous and next channels (next 3 episodes per channel by default)
+- Mark-as-viewed flow: delete viewed files and remove torrents so episodes can be re-downloaded later
+- Backwards-compatible save paths so the rest of the player logic can still read files from expected locations
 
-Each subfolder in your catalog becomes a channel. The folder name is the channel name.
-Ad-break folders named Commercials, Bumpers, Promos, or Station IDs are skipped
-as channels and can be configured separately in Advanced Config.
-
-```
-My Catalog/
-  HBO/
-    The Sopranos/
-      S01E01.mp4
-  Cartoon Network/
-    Futurama/
-      S01E01.mp4
-  MTV/
-    music_video_01.mp4
-```
-
-That's it! No metadata files. No renaming. As simple as I could make it :)
-
-### 2. Download and open MediaWave2000
-
-→ **[Download the latest release](https://github.com/Mamaweegee123/MediaWave2000/releases)**
-
-- **Mac:** Open `MediaWave.app`
-- **Windows:** Run `MediaWave2000.exe`
-
-### 3. Choose your catalog and watch TV
-
-Hit **Choose Catalog**, point it at your folder, press **Watch TV**.
-
-### 4. Controls
-
-- **[+ & -]** - Channel Up and Channel Down
-- **[< & >]** - Rewind and Fast Forward in Vault
-- **[Space]** - Play/Pause in Vault
-- **[G]** - Guide
-- **[M]** - Menu
-- **[V]** - Vault
-- **[I]** - Info
-- **[Arrow Keys]** - Move Cursor in Menus
+See `FEATURES.md` in the original project for additional UI features that can still be integrated (themes, logos, vault, commercials).
 
 ---
 
-## Optional Setup
+## Repository layout
 
-**Channel logos** — drop a `logo.png` inside a `Logos/` subfolder in any channel folder:
-```
-HBO/
-  Logos/
-    logo.png
+- indexer_client.py — IndexerClient for Jackett/Prowlarr searches with CRT scoring
+- torrent_streamer.py — libtorrent integration, buffering, file-priority, mark-as-viewed
+- channels/ — channel XML files (one per channel). Example: `channels/twilight_zone.xml`
+- tools/load_channels.py — CLI: populate magnets from indexer and optionally start streamer
+- tests/ — pytest tests (libtorrent mocked for CI)
+- requirements.txt — runtime and test dependencies
+
+---
+
+## Channels and playlist format
+
+Place one XML file per channel in the `channels/` directory. Each file contains ordered `<episode>` elements; the loader preserves element order. Use a minimal schema so files remain human-editable.
+
+Minimal episode element:
+
+```xml
+<episode id="tz-s01e01" season="1" episode="1">
+  <title>Twilight Zone S01E01</title>
+  <save_path>data/videos/twilight_zone/s01e01.mp4</save_path>
+  <magnet></magnet>
+  <min_seeders>1</min_seeders>
+  <priority>1</priority>
+  <note>Prefer 480i/4:3 releases</note>
+</episode>
 ```
 
-**Commercials** — put short video clips in any folder and point MediaWave at it in Advanced Config. Real VHS-ripped ads work great.
+- `title` (required): Query string used by IndexerClient
+- `save_path` (recommended): where downloads are written (repo-relative paths suggested)
+- `magnet` (optional): pre-fill to skip indexer lookups
+- `min_seeders` (optional): read by loader but currently not enforced
+- `priority` / `note` (optional): metadata for ordering and human notes
 
-**Custom music** — drop audio files in `User Content/Music/` for the RadioWave TV companion channel, or keep them wherever you have them and just simply point MediaWave to the folder in "Advanced Config".
-
-Full setup guides are in the `docs/` folder inside the app.
-
----
-
-## Themes
-
-MediaWave2000 ships with three visual themes, each with multiple color options:
-
-| Theme | Vibe |
-|-------|------|
-| **Set-Top Box** | 80s/90s cable box nostalgia |
-| **Promised Future** | Mid-2000s digital optimism |
-| **Sleek Freak** | Clean modern flat UI |
+Example sample channel included: `channels/twilight_zone.xml`.
 
 ---
 
-## Companion Channels
+## Indexer behavior and scoring
 
-Beyond your own library, MediaWave includes three built-in channels:
-
-- **WeatherStar 4000+** — a local weather display channel in the style of the classic Weather Channel
-- **RadioWave TV** — plays your music library with a reactive audio visualizer
-- **NetTV** *(beta)* — paste a YouTube playlist URL and it generates a live channel schedule from the videos
+- Default providers: Jackett (tried first) and Prowlarr (fallback). API key handling matches common conventions (Jackett: `apikey` query param, Prowlarr: `X-Api-Key` header).
+- Category restriction: searches limited to SD TV (5030) and SD Movies (2030) to bias results toward CRT-appropriate releases.
+- Title scoring: positive weight for `480i`, `480p`, `DVDRip`, `SDTV`, `4:3` patterns; penalties for `1080p`, `4k`, `BluRay` and similar markers. The final candidate score = title_score * 10 + log(1 + seeders) so title-fit is prioritized and seeders break ties.
 
 ---
 
-## MediaWave Converter
+## Streaming and buffering
 
-A separate app included with MediaWave2000. Drop video files onto it and it batch-converts them to .mp4, .mkv, or .avi with consistent framing — removes letterboxing, normalizes resolution and audio, handles subtitle burn-in. Useful for old MKVs, weird rips, or anything that doesn't quite play how you'd like.
+- Use python-libtorrent to add magnet links and download into the configured save root (default `data/videos/`).
+- After adding a magnet the streamer runs a background metadata worker that:
+  - Waits for torrent metadata,
+  - Attempts to locate the desired file inside the torrent (matching `save_path` suffix or falling back to single-file torrents),
+  - Applies high file priority to that file and attempts to enable sequential download (if supported), to improve start-of-playback latency.
+- Buffering policy: the loader buffers the current channel, the one above it, and the one below it (by filename ordering) and fetches the next 3 episodes per channel. The streamer keeps only the configured buffer set active and evicts older torrents.
 
-Requires **ffmpeg** to be installed. See `docs/Converter Guide.txt` for setup.
-
----
-
-## Platform Support
-
-| Platform | Status |
-|----------|--------|
-| macOS | Available |
-| Windows | Available |
-| Linux | In Progress |
-| Raspberry Pi | Planned |
+Limitations: piece-priority + sequential download improves linear playback but seeking arbitrarily still depends on pieces already downloaded; perfect random-access streaming would need more advanced piece control.
 
 ---
 
-## Roadmap
+## Mark-as-viewed and re-download
 
-- [ ] Linux release
-- [ ] Custom theme support
-- [ ] EAS-style scrolling message system (in progress)
-- [ ] NetTV stability improvements (in progress)
-- [ ] Raspberry Pi lightweight build
-- [ ] Steam / Steam Deck release (long-term)
+- Call `TorrentStreamer.mark_episode_viewed(ep)` with an episode dict (`magnet` and `save_path`) to delete the file and remove the torrent from the session.
+- The channel XML keeps the `<magnet>` so a subsequent buffering run will re-download the episode when it enters the buffer window.
 
 ---
 
-## FAQ
+## CLI examples
 
-**Do I need to convert all my files?**
-Nope! Most modern video files play fine as-is. Use the Converter when something doesn't look right, or if you want all your files to be the same format, audio level etc.
+Populate magnets only (no streaming):
 
-**Can I use an external drive?**
-Yes, your catalog can live anywhere your system can read — USB drive, NAS, network share, wherever.
+```bash
+python tools/load_channels.py --base-url http://localhost:9117 --api-key YOUR_KEY
+```
 
-**Does this connect to the internet?**
-NetTV (YouTube) and WeatherStar 4000+ do, but Your video library stays local.
+Populate magnets and start streaming/buffering:
 
-**Is this free?**
-Yes. Free to download, no account required, no subscription.
+```bash
+python tools/load_channels.py \
+  --base-url http://localhost:9117 \
+  --api-key YOUR_KEY \
+  --stream \
+  --current-channel-file twilight_zone.xml \
+  --current-episode-id tz-s01e02
+```
 
----
+Mark an episode as viewed (example within Python):
 
-## Developing MediaWave2000
+```python
+from torrent_streamer import TorrentStreamer
 
-MediaWave2000 came to be after I realized how cool **FieldStation42** was but wanted something that can automatically convert your entire catalog just by the click of a button and it kind of ballooned out to what it is now (with more features coming soon!). I really want this to be something completely customizeable by you and build a community where we can share our setups, custom themes (when implemented), and bring back the golden age of television! This is still a very early beta so feel free to reach out and let me know of anything you found that needs fixing or features you'd personally like to see! 
-
----
-
-## Credits
-
-Inspired by the concept behind [FieldStation42](https://github.com/shane-mason/FieldStation42) — built for everyone who loved the idea but couldn't get it working, and everyone who misses watching cable TV.
-
----
-
-## Support MediaWave
-
-MediaWave is a passion project built in my spare time to bring back the nostalgia of scrolling through a TV Guide!
-
-If you've enjoyed using MediaWave and would like to support future development, you can buy me a coffee on Ko-fi:
-
-**☕ Support MediaWave:** https://ko-fi.com/Mamaweegee123
-
-Support is completely optional, but every contribution helps fund development, testing hardware, and future features. And keeping my belly full :)
-
-Thank you for checking out MediaWave!
+ts = TorrentStreamer(save_root="data/videos")
+ep = {"magnet": "magnet:?xt=urn:btih:EXAMPLE", "save_path": "twilight_zone/s01e01.mp4"}
+ts.mark_episode_viewed(ep)
+```
 
 ---
 
-**NO copyrighted media is included with MediaWave 2000. Users must supply their own legally obtained media files.** *Pwease >.<*
+## Testing and development
 
+- Install development requirements and run tests:
+
+```bash
+pip install -r requirements.txt
+pytest
+```
+
+Unit tests mock libtorrent so CI can run without a platform-specific libtorrent wheel.
+
+---
+
+## Installing python-libtorrent
+
+python-libtorrent can be platform-dependent. Common advice:
+
+- Debian/Ubuntu:
+  ```bash
+  sudo apt-get install -y python3-libtorrent
+  ```
+  or install `libtorrent-rasterbar-dev` and build the Python bindings if needed.
+
+- macOS:
+  Use Homebrew to install libtorrent and then install a compatible Python wheel or build python-libtorrent from source.
+
+- Windows:
+  Look for prebuilt wheels for your Python version or run the streamer on a Linux host/container if wheel support is limited.
+
+Tell me your OS and Python version and I can give step-by-step instructions.
+
+---
+
+## Roadmap and next steps
+
+- Integrate an external player (mpv) that notifies the streamer to mark episodes viewed automatically on playback end
+- Improve file-matching heuristics inside torrents (basename-fuzzy matching and regex rules)
+- Add a small HTTP control API or CLI for remote control and to mark episodes viewed from external players
+- Add a monitoring UI to display buffering progress and torrent health
+- Persist streamer state across restarts
+
+---
+
+## Credits & original content
+
+This fork is based on MediaWave2000. Much of the original README content, screenshots, and ideas are preserved here with a new focus on torrent-sourced streaming for CRT-targeted playback.
+
+**NO copyrighted media is included with TorrentWave2000. Users must supply their own legally obtained media files.**
 
 *Tune in. Sit back. There's always something on.*
