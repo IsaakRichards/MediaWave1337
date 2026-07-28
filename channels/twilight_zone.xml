@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<channel name="Twilight Zone">
+  <!-- Episodes are in playback order. Add more <episode> entries as needed. -->
+  <episode id="tz-s01e01" season="1" episode="1">
+    <title>Twilight Zone S01E01</title>
+    <save_path>data/videos/twilight_zone/s01e01.mp4</save_path>
+    <magnet></magnet>
+    <min_seeders>1</min_seeders>
+    <priority>1</priority>
+    <note>Prefer 480i/4:3 releases</note>
+  </episode>
+
+  <episode id="tz-s01e02" season="1" episode="2">
+    <title>Twilight Zone S01E02</title>
+    <save_path>data/videos/twilight_zone/s01e02.mp4</save_path>
+    <magnet></magnet>
+    <min_seeders>1</min_seeders>
+    <priority>2</priority>
+  </episode>
+
+  <episode id="tz-s01e03" season="1" episode="3">
+    <title>Twilight Zone S01E03</title>
+    <save_path>data/videos/twilight_zone/s01e03.mp4</save_path>
+    <magnet></magnet>
+    <min_seeders>1</min_seeders>
+    <priority>3</priority>
+  </episode>
+</channel>
