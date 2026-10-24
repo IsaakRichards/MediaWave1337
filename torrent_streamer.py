@@ -1,215 +1,593 @@
 """
 torrent_streamer.py
 
-Enhanced torrent streamer with piece/file-priority support for streaming and
-support to mark episodes as viewed (delete files and remove torrents so they
-can be re-downloaded later).
+libtorrent-backed episode streamer for MediaWave1337.
+
+Episodes are plain dicts (as produced by torrent_channels.parse_channel_file)
+with at least a ``magnet`` source and ideally ``channel``, ``id``, ``season``
+and ``episode``. The source may be a magnet URI, an http(s) link to a .torrent
+file (as Jackett/Prowlarr often return), or a local .torrent path.
+
+Torrents are tracked by info-hash, so several episodes can share one torrent
+(season packs): each episode selects its own file inside the torrent and only
+selected files are downloaded.
+
+The streamer is single-threaded by design: call ``poll()`` regularly (the app
+does this from a QTimer, tools/load_channels.py from its main loop). Only the
+network fetch of .torrent URLs runs on a worker thread, and it hands results
+back through a queue that ``poll()`` drains.
 """
 
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Any, Tuple
+import hashlib
 import logging
-import time
 import os
+import queue
+import re
 import threading
+import time
 
 logger = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 try:
     import libtorrent as lt
-except Exception as exc:  # pragma: no cover - libtorrent may not be present in test env
+except Exception:  # pragma: no cover - libtorrent may not be present in test env
     lt = None
+
+try:
+    import requests
+except Exception:  # pragma: no cover
+    requests = None
+
+
+VIDEO_EXTS = (
+    ".mp4", ".mkv", ".avi", ".m4v", ".mov", ".mpg", ".mpeg", ".ts", ".m2ts",
+    ".wmv", ".divx", ".ogm", ".webm", ".vob", ".flv",
+)
+
+# Seconds of contiguous data ahead of the playhead required before tuning in
+# to a partially downloaded file.
+MIN_BUFFER_SECONDS = 45.0
+# Pieces at the start/end of a file that must be present before playback, so
+# container headers and trailing indexes (MP4 moov, AVI idx1, MKV cues) exist.
+HEAD_PIECES = 3
+TAIL_PIECES = 2
+# Pieces ahead of the playhead that get streaming deadlines.
+DEADLINE_WINDOW_PIECES = 24
 
 
 class TorrentStreamerError(Exception):
     pass
 
 
+def _layout(ti):
+    """file_storage of a torrent_info (libtorrent 2.1 renamed files() to layout())."""
+    return ti.layout() if hasattr(ti, "layout") else ti.files()
+
+
+def episode_key(ep: Dict) -> str:
+    if ep.get("key"):
+        return str(ep["key"])
+    return f"{ep.get('channel', '')}|{ep.get('id') or ep.get('title') or ep.get('magnet', '')}"
+
+
+def _episode_patterns(season: Any, episode: Any) -> List["re.Pattern"]:
+    try:
+        s = int(season)
+        e = int(episode)
+    except (TypeError, ValueError):
+        return []
+    return [
+        re.compile(rf"(?<![a-z0-9])s0*{s}[ ._-]*e0*{e}(?![0-9])", re.IGNORECASE),
+        re.compile(rf"(?<![0-9]){s}x0*{e}(?![0-9])", re.IGNORECASE),
+        re.compile(rf"season[ ._-]*0*{s}\D+?(?:episode|ep)[ ._-]*0*{e}(?![0-9])", re.IGNORECASE),
+    ]
+
+
+def select_episode_file(files: List[Tuple[int, str, int]], season: Any = None, episode: Any = None) -> Optional[int]:
+    """Pick the file index inside a torrent that holds the wanted episode.
+
+    files: list of (index, path_inside_torrent, size_bytes).
+    Prefers video files whose name matches SxxEyy / NxNN for the given
+    season/episode, then falls back to the largest video file. Samples are
+    ignored. Returns None for torrents with no usable file.
+    """
+    if not files:
+        return None
+
+    def is_sample(path: str) -> bool:
+        name = os.path.basename(path).lower()
+        parts = re.split(r"[\\/]", path.lower())
+        return "sample" in parts[:-1] or bool(re.search(r"(?<![a-z])sample(?![a-z])", name))
+
+    videos = [f for f in files if f[1].lower().endswith(VIDEO_EXTS) and not is_sample(f[1])]
+    if not videos:
+        videos = [f for f in files if f[1].lower().endswith(VIDEO_EXTS)]
+    if not videos:
+        return None
+
+    patterns = _episode_patterns(season, episode)
+    if patterns and len(videos) > 1:
+        matches = [f for f in videos if any(p.search(f[1]) for p in patterns)]
+        if matches:
+            return max(matches, key=lambda f: f[2])[0]
+        logger.warning("No file matched S%sE%s; falling back to the largest video file", season, episode)
+    return max(videos, key=lambda f: f[2])[0]
+
+
+def compute_readiness(
+    have: List[bool],
+    first_piece: int,
+    last_piece: int,
+    file_size: int,
+    piece_length: int,
+    file_offset_in_torrent: int,
+    downloaded_bytes: int,
+    offset_seconds: float,
+    duration_seconds: float,
+    download_rate: float,
+) -> Dict[str, Any]:
+    """Decide whether a (possibly partial) file can be played from offset_seconds.
+
+    Pure function so it can be tested without libtorrent. ``have`` is the
+    torrent-wide piece bitfield.
+    """
+    total = max(1, file_size)
+    progress = min(1.0, downloaded_bytes / total)
+    if downloaded_bytes >= file_size > 0:
+        return {"ready": True, "complete": True, "progress": 1.0, "buffered_seconds": float("inf")}
+
+    def has(p: int) -> bool:
+        return 0 <= p < len(have) and bool(have[p])
+
+    head_end = min(last_piece, first_piece + HEAD_PIECES - 1)
+    head_ok = all(has(p) for p in range(first_piece, head_end + 1))
+    tail_start = max(first_piece, last_piece - TAIL_PIECES + 1)
+    tail_ok = all(has(p) for p in range(tail_start, last_piece + 1))
+
+    result = {"ready": False, "complete": False, "progress": progress, "buffered_seconds": 0.0}
+    if duration_seconds <= 0 or not head_ok or not tail_ok:
+        return result
+
+    bytes_per_second = file_size / duration_seconds
+    fraction = min(max(offset_seconds / duration_seconds, 0.0), 1.0)
+    offset_byte = file_offset_in_torrent + int(file_size * fraction)
+    start_piece = max(first_piece, min(last_piece, offset_byte // max(1, piece_length)))
+
+    contiguous = 0
+    piece = start_piece
+    while piece <= last_piece and has(piece):
+        contiguous += 1
+        piece += 1
+    buffered_bytes = contiguous * piece_length
+    buffered_seconds = buffered_bytes / max(1.0, bytes_per_second)
+    remaining_seconds = max(0.0, duration_seconds - offset_seconds)
+    missing_pieces = sum(1 for p in range(start_piece, last_piece + 1) if not has(p))
+    missing_bytes = missing_pieces * piece_length
+
+    result["buffered_seconds"] = buffered_seconds
+    if piece > last_piece:
+        # Everything from the playhead to the end is present.
+        result["ready"] = True
+        return result
+    keeps_up = download_rate > 0 and (download_rate * remaining_seconds * 0.85) >= missing_bytes
+    result["ready"] = buffered_seconds >= MIN_BUFFER_SECONDS and keeps_up
+    return result
+
+
 class TorrentStreamer:
-    def __init__(self, save_root: str = "data/videos", listen_port=(6881, 6891), session_settings: Optional[dict] = None, metadata_timeout: int = 30):
+    def __init__(
+        self,
+        save_root: str = "data/videos",
+        listen_port: int = 6881,
+        torrent_cache_dir: Optional[str] = None,
+        download_rate_limit: int = 0,
+        upload_rate_limit: int = 0,
+        delete_evicted: bool = True,
+    ):
         if lt is None:
-            raise TorrentStreamerError("python-libtorrent (libtorrent) is required but not installed")
-        self.save_root = save_root
-        self.session = lt.session()
-        self.session.listen_on(listen_port[0], listen_port[1])
-        # Minimal alert mask
-        self.session.set_alert_mask(lt.alert.category_t.status_notification)
-        self.torrents: Dict[str, Dict] = {}  # magnet -> {handle, save_path, added_at, rel_path}
-        self.metadata_timeout = metadata_timeout
-        logger.info("TorrentStreamer session started, saving to: %s", save_root)
-
-    def _full_path(self, rel_save_path: Optional[str]) -> str:
-        if not rel_save_path:
-            return self.save_root
-        if os.path.isabs(rel_save_path):
-            return rel_save_path
-        return os.path.join(self.save_root, rel_save_path)
-
-    def _metadata_worker(self, magnet_uri: str, handle, rel_save_path: Optional[str]):
-        """Background worker that waits for metadata and then prioritizes the
-        specific file for streaming (high file priority and sequential download).
-        """
-        try:
-            t0 = time.time()
-            while not handle.has_metadata():
-                if time.time() - t0 > self.metadata_timeout:
-                    logger.warning("Timeout waiting for metadata for %s", magnet_uri)
-                    return
-                time.sleep(0.5)
-            ti = handle.get_torrent_info()
-            files = ti.files()
-            file_idx = None
-            # try to match rel_save_path to one of the torrent file paths
-            if rel_save_path:
-                for i in range(files.num_files()):
-                    fp = files.file_path(i)
-                    # match by suffix to allow different save root/path forms
-                    if fp.endswith(rel_save_path) or fp == rel_save_path:
-                        file_idx = i
-                        break
-            # if not found and torrent has a single file, pick 0
-            if file_idx is None and files.num_files() == 1:
-                file_idx = 0
-
-            if file_idx is not None:
-                # set file priorities: 0 = don't download, 1..7 prioritized
-                priorities = [0] * files.num_files()
-                priorities[file_idx] = 7
-                try:
-                    handle.prioritize_files(priorities)
-                    logger.info("Set file priority for %s (file index %s)", magnet_uri, file_idx)
-                except Exception:
-                    logger.exception("Failed to call prioritize_files on handle for %s", magnet_uri)
-            # enable sequential download for smoother streaming if available
-            try:
-                if hasattr(handle, "set_sequential_download"):
-                    handle.set_sequential_download(True)
-                    logger.debug("Enabled sequential download for %s", magnet_uri)
-            except Exception:
-                logger.exception("Failed to set sequential download for %s", magnet_uri)
-        except Exception:
-            logger.exception("Exception in metadata worker for %s", magnet_uri)
-
-    def add_magnet(self, magnet_uri: str, rel_save_path: Optional[str] = None) -> 'lt.torrent_handle':
-        """Add a magnet URI and start downloading it. rel_save_path is the file
-        path relative to save_root that we want prioritized for streaming.
-        Returns the libtorrent torrent_handle. If magnet already added, returns existing handle.
-        """
-        if magnet_uri in self.torrents:
-            logger.debug("Magnet already added: %s", magnet_uri)
-            return self.torrents[magnet_uri]["handle"]
-
-        save_path_dir = self.save_root
-        if rel_save_path:
-            save_dir = os.path.dirname(rel_save_path)
-            if save_dir:
-                os.makedirs(os.path.join(self.save_root, save_dir), exist_ok=True)
-            save_path_dir = os.path.join(self.save_root, os.path.dirname(rel_save_path)) or self.save_root
-
-        params = {
-            'save_path': save_path_dir,
-            'storage_mode': lt.storage_mode_t.storage_mode_sparse,
+            raise TorrentStreamerError("libtorrent is required but not installed (pip install libtorrent)")
+        self.save_root = os.path.abspath(save_root)
+        self.torrent_cache_dir = os.path.abspath(torrent_cache_dir or os.path.join(self.save_root, ".torrents"))
+        self.delete_evicted = delete_evicted
+        os.makedirs(self.save_root, exist_ok=True)
+        os.makedirs(self.torrent_cache_dir, exist_ok=True)
+        settings = {
+            "listen_interfaces": f"0.0.0.0:{int(listen_port)},[::]:{int(listen_port)}",
+            "alert_mask": int(lt.alert.category_t.error_notification | lt.alert.category_t.status_notification),
+            "download_rate_limit": int(download_rate_limit),
+            "upload_rate_limit": int(upload_rate_limit),
         }
-        logger.info("Adding magnet: %s -> %s", magnet_uri, save_path_dir)
-        handle = lt.add_magnet_uri(self.session, magnet_uri, params)
-        self.torrents[magnet_uri] = {"handle": handle, "save_path": save_path_dir, "added_at": time.time(), "rel_path": rel_save_path}
+        self.session = lt.session(settings)
+        # info_hash -> {"handle", "save_path", "added_at", "metadata_saved"}
+        self.torrents: Dict[str, Dict[str, Any]] = {}
+        # episode key -> {"ep", "info_hash", "file_index", "error", "state"}
+        self.episodes: Dict[str, Dict[str, Any]] = {}
+        self._fetch_results: "queue.Queue[Tuple[str, Any, Optional[str]]]" = queue.Queue()
+        self._focus: Optional[Tuple[str, float, float]] = None
+        logger.info("TorrentStreamer session started, saving to: %s", self.save_root)
 
-        # Start background thread to prioritize on metadata ready
-        th = threading.Thread(target=self._metadata_worker, args=(magnet_uri, handle, rel_save_path), daemon=True)
-        th.start()
-        return handle
+    # ---------------- paths ---------------- #
 
-    def remove_magnet(self, magnet_uri: str) -> None:
-        info = self.torrents.get(magnet_uri)
-        if not info:
-            return
-        handle = info["handle"]
+    def episode_save_dir(self, ep: Dict) -> str:
+        """Directory torrents for this episode are saved into."""
+        custom = (ep.get("save_path") or "").strip()
+        if custom:
+            if custom.lower().endswith(VIDEO_EXTS):
+                custom = os.path.dirname(custom)
+            # Legacy channel files used repo-relative "data/videos/..." paths.
+            for prefix in ("data/videos/", "data\\videos\\"):
+                if custom.startswith(prefix):
+                    custom = custom[len(prefix):]
+            if custom:
+                return custom if os.path.isabs(custom) else os.path.join(self.save_root, custom)
+        channel = re.sub(r"[^A-Za-z0-9._ -]+", "_", str(ep.get("channel") or "misc")).strip() or "misc"
+        return os.path.join(self.save_root, channel)
+
+    def _cache_path(self, name: str) -> str:
+        return os.path.join(self.torrent_cache_dir, f"{name}.torrent")
+
+    # ---------------- adding sources ---------------- #
+
+    @staticmethod
+    def _handle_hash(handle) -> str:
         try:
-            self.session.remove_torrent(handle)
-            logger.info("Removed torrent for magnet: %s", magnet_uri)
+            return str(handle.info_hashes().get_best())
         except Exception:
-            logger.exception("Failed to remove torrent for %s", magnet_uri)
-        finally:
-            del self.torrents[magnet_uri]
+            return str(handle.info_hash())
+
+    def _magnet_params(self, magnet: str):
+        atp = lt.parse_magnet_uri(magnet)
+        try:
+            info_hash = str(atp.info_hashes.get_best())
+        except Exception:
+            info_hash = str(atp.info_hash)
+        cached = self._cache_path(info_hash)
+        if os.path.isfile(cached):
+            try:
+                atp.ti = lt.torrent_info(cached)
+            except Exception:
+                logger.debug("Ignoring unreadable cached metadata %s", cached)
+        return atp
+
+    def _torrent_file_params(self, data: bytes):
+        atp = lt.add_torrent_params()
+        atp.ti = lt.torrent_info(lt.bdecode(data))
+        return atp
+
+    def _fetch_torrent_url(self, key: str, url: str) -> None:
+        """Worker thread: download a .torrent (or follow a redirect to a magnet)."""
+        cached = self._cache_path(hashlib.sha1(url.encode("utf-8")).hexdigest())
+        try:
+            if os.path.isfile(cached):
+                with open(cached, "rb") as fh:
+                    self._fetch_results.put((key, fh.read(), None))
+                return
+            if requests is None:
+                raise TorrentStreamerError("requests is required to fetch .torrent URLs")
+            target = url
+            for _ in range(5):
+                response = requests.get(target, timeout=30, allow_redirects=False)
+                location = response.headers.get("Location", "")
+                if response.is_redirect and location:
+                    if location.startswith("magnet:"):
+                        self._fetch_results.put((key, location, None))
+                        return
+                    target = requests.compat.urljoin(target, location)
+                    continue
+                response.raise_for_status()
+                data = response.content
+                with open(cached, "wb") as fh:
+                    fh.write(data)
+                self._fetch_results.put((key, data, None))
+                return
+            raise TorrentStreamerError("Too many redirects")
+        except Exception as exc:
+            self._fetch_results.put((key, None, f"Could not fetch torrent: {exc}"))
+
+    def _attach(self, key: str, atp) -> None:
+        info = self.episodes.get(key)
+        if info is None:
+            return
+        atp.save_path = self.episode_save_dir(info["ep"])
+        os.makedirs(atp.save_path, exist_ok=True)
+        atp.storage_mode = lt.storage_mode_t.storage_mode_sparse
+        # Download nothing until poll() knows which file the episode needs.
+        atp.flags |= lt.torrent_flags.sequential_download | lt.torrent_flags.default_dont_download
+        handle = self.session.add_torrent(atp)
+        info_hash = self._handle_hash(handle)
+        if info_hash not in self.torrents:
+            self.torrents[info_hash] = {"handle": handle, "save_path": atp.save_path, "added_at": time.time(), "metadata_saved": False}
+            logger.info("Added torrent %s -> %s", info_hash, atp.save_path)
+        info["info_hash"] = info_hash
+        info["state"] = "metadata"
+
+    def add_episode(self, ep: Dict) -> str:
+        """Start fetching an episode. Returns its key. Safe to call repeatedly."""
+        key = episode_key(ep)
+        existing = self.episodes.get(key)
+        source = (ep.get("magnet") or "").strip()
+        if existing and existing["ep"].get("magnet") == ep.get("magnet"):
+            existing["ep"] = dict(ep)
+            return key
+        if existing:
+            self.remove_episode(key, delete_files=False)
+        info = {"ep": dict(ep), "info_hash": None, "file_index": None, "error": None, "state": "resolving"}
+        self.episodes[key] = info
+        if not source:
+            info["state"] = "error"
+            info["error"] = "No magnet link yet"
+            return key
+        try:
+            if source.startswith("magnet:"):
+                self._attach(key, self._magnet_params(source))
+            elif source.lower().startswith(("http://", "https://")):
+                threading.Thread(target=self._fetch_torrent_url, args=(key, source), daemon=True).start()
+            elif os.path.isfile(source):
+                with open(source, "rb") as fh:
+                    self._attach(key, self._torrent_file_params(fh.read()))
+            else:
+                raise TorrentStreamerError(f"Unsupported torrent source: {source[:60]}")
+        except Exception as exc:
+            logger.exception("Failed to add episode %s", key)
+            info["state"] = "error"
+            info["error"] = str(exc)
+        return key
+
+    # ---------------- removal ---------------- #
+
+    def _episodes_for_hash(self, info_hash: str) -> List[str]:
+        return [k for k, v in self.episodes.items() if v.get("info_hash") == info_hash]
+
+    def remove_episode(self, key: str, delete_files: bool = True) -> None:
+        info = self.episodes.pop(key, None)
+        if not info or not info.get("info_hash"):
+            return
+        info_hash = info["info_hash"]
+        torrent = self.torrents.get(info_hash)
+        if not torrent:
+            return
+        if not self._episodes_for_hash(info_hash):
+            flags = lt.options_t.delete_files if delete_files else 0
+            try:
+                self.session.remove_torrent(torrent["handle"], flags)
+                logger.info("Removed torrent %s%s", info_hash, " and its files" if delete_files else "")
+            except Exception:
+                logger.exception("Failed to remove torrent %s", info_hash)
+            del self.torrents[info_hash]
+            return
+        # Other episodes still use this torrent (season pack): drop just this file.
+        index = info.get("file_index")
+        if index is None:
+            return
+        still_wanted = any(self.episodes[k].get("file_index") == index for k in self._episodes_for_hash(info_hash))
+        if still_wanted:
+            return
+        handle = torrent["handle"]
+        try:
+            handle.file_priority(index, 0)
+        except Exception:
+            logger.debug("Could not lower priority of file %s", index)
+        if delete_files:
+            path = self._file_path(torrent, index)
+            if path and os.path.isfile(path):
+                try:
+                    os.remove(path)
+                    logger.info("Deleted file %s", path)
+                except OSError:
+                    logger.debug("Could not delete %s", path)
 
     def mark_episode_viewed(self, ep: Dict) -> None:
-        """Delete the episode's file (if present) and remove any associated torrent so
-        that it will be re-downloaded later when buffered again.
-
-        ep should be a dict containing at least 'magnet' and 'save_path' (relative or absolute).
-        """
-        magnet = ep.get("magnet")
-        rel_save = ep.get("save_path")
-        full_path = self._full_path(rel_save)
-
-        # Delete the file if it exists
-        try:
-            if os.path.exists(full_path):
-                os.remove(full_path)
-                logger.info("Deleted viewed file: %s", full_path)
-                # attempt to remove parent directory if empty
-                parent = os.path.dirname(full_path)
-                try:
-                    if parent and os.path.isdir(parent) and not os.listdir(parent):
-                        os.rmdir(parent)
-                        logger.debug("Removed empty directory: %s", parent)
-                except Exception:
-                    logger.debug("Could not remove parent directory: %s", parent)
-            else:
-                logger.debug("Viewed file not present (nothing to delete): %s", full_path)
-        except Exception:
-            logger.exception("Failed to delete file for viewed episode: %s", full_path)
-
-        # Remove torrent if currently added
-        if magnet and magnet in self.torrents:
-            logger.info("Removing torrent for viewed episode: %s", magnet)
-            self.remove_magnet(magnet)
-
-    def _ensure_not_more_than(self, keep_magnets: List[str]) -> None:
-        """Remove any torrents we are tracking that are not in keep_magnets."""
-        for mag in list(self.torrents.keys()):
-            if mag not in keep_magnets:
-                logger.debug("Evicting magnet from buffer: %s", mag)
-                self.remove_magnet(mag)
+        """Delete the episode's downloaded file and drop its torrent so it can be
+        fetched again the next time it enters the buffer window."""
+        self.remove_episode(episode_key(ep), delete_files=True)
 
     def buffer_episodes(self, episodes: List[Dict], max_active: Optional[int] = None) -> None:
-        """Ensure the given episodes (list of dicts with 'magnet' and optional 'save_path')
-        are being downloaded. Evict other torrents that are not in this list.
+        """Make sure exactly these episodes (in playback order) are downloading,
+        evicting everything else."""
+        wanted = [ep for ep in episodes if (ep.get("magnet") or "").strip()]
+        if max_active:
+            wanted = wanted[:max_active]
+        keep = set()
+        for ep in wanted:
+            keep.add(self.add_episode(ep))
+        for key in list(self.episodes.keys()):
+            if key not in keep:
+                logger.debug("Evicting episode from buffer: %s", key)
+                self.remove_episode(key, delete_files=self.delete_evicted)
 
-        max_active: if provided, ensures we only keep that many active torrents (evict older ones by added_at).
-        """
-        keep = []
-        for ep in episodes:
-            magnet = ep.get("magnet")
-            if not magnet:
-                logger.warning("Episode missing magnet; skipping buffering: %s", ep.get("title"))
+    # ---------------- polling ---------------- #
+
+    def _file_path(self, torrent: Dict, index: int) -> Optional[str]:
+        ti = torrent["handle"].torrent_file()
+        if ti is None:
+            return None
+        return os.path.join(torrent["save_path"], _layout(ti).file_path(index))
+
+    def _save_metadata(self, info_hash: str, torrent: Dict) -> None:
+        if torrent.get("metadata_saved"):
+            return
+        torrent["metadata_saved"] = True
+        path = self._cache_path(info_hash)
+        if os.path.isfile(path):
+            return
+        try:
+            ti = torrent["handle"].torrent_file()
+            data = lt.bencode({b"info": lt.bdecode(ti.info_section())})
+            with open(path, "wb") as fh:
+                fh.write(data)
+        except Exception:
+            logger.debug("Could not cache metadata for %s", info_hash)
+
+    def _apply_file_priorities(self, info_hash: str) -> None:
+        torrent = self.torrents[info_hash]
+        handle = torrent["handle"]
+        ti = handle.torrent_file()
+        if ti is None:
+            return
+        wanted = {self.episodes[k]["file_index"] for k in self._episodes_for_hash(info_hash)}
+        wanted.discard(None)
+        priorities = [4 if i in wanted else 0 for i in range(ti.num_files())]
+        if list(handle.get_file_priorities()) != priorities:
+            handle.prioritize_files(priorities)
+
+    def poll(self) -> None:
+        while True:
+            try:
+                key, payload, error = self._fetch_results.get_nowait()
+            except queue.Empty:
+                break
+            info = self.episodes.get(key)
+            if info is None:
                 continue
-            rel_save = ep.get("save_path")
-            # If file already exists on disk, we assume it's already downloaded and skip adding torrent
-            fullpath = self._full_path(rel_save)
-            if os.path.exists(fullpath) and magnet not in self.torrents:
-                logger.info("File already present on disk, skipping add: %s", fullpath)
-                keep.append(magnet)
+            if error:
+                info["state"] = "error"
+                info["error"] = error
                 continue
-            if magnet not in self.torrents:
-                try:
-                    self.add_magnet(magnet, rel_save)
-                except Exception:
-                    logger.exception("Failed to add magnet: %s", magnet)
+            try:
+                atp = self._magnet_params(payload) if isinstance(payload, str) else self._torrent_file_params(payload)
+                self._attach(key, atp)
+            except Exception as exc:
+                info["state"] = "error"
+                info["error"] = f"Invalid torrent: {exc}"
+
+        for alert in self.session.pop_alerts():
+            if alert.category() & lt.alert.category_t.error_notification:
+                logger.warning("libtorrent: %s", alert.message())
+
+        for info_hash, torrent in self.torrents.items():
+            handle = torrent["handle"]
+            if not handle.is_valid() or not handle.status().has_metadata:
+                continue
+            self._save_metadata(info_hash, torrent)
+            ti = handle.torrent_file()
+            files = _layout(ti)
+            listing = [(i, files.file_path(i), files.file_size(i)) for i in range(files.num_files())]
+            changed = False
+            for key in self._episodes_for_hash(info_hash):
+                info = self.episodes[key]
+                if info["file_index"] is not None:
                     continue
-            keep.append(magnet)
+                ep = info["ep"]
+                index = select_episode_file(listing, ep.get("season"), ep.get("episode"))
+                if index is None:
+                    info["state"] = "error"
+                    info["error"] = "Torrent has no video file"
+                    continue
+                info["file_index"] = index
+                info["state"] = "downloading"
+                changed = True
+                logger.info("Episode %s -> %s", key, files.file_path(index))
+            if changed:
+                self._apply_file_priorities(info_hash)
 
-        # Optionally enforce max_active count
-        if max_active and len(keep) > max_active:
-            # sort by order in keep (which should be playback order), trim to max_active
-            keep = keep[:max_active]
-        self._ensure_not_more_than(keep)
+        if self._focus:
+            self._apply_focus(*self._focus)
+
+    # ---------------- streaming ---------------- #
+
+    def _file_layout(self, info: Dict):
+        torrent = self.torrents.get(info.get("info_hash") or "")
+        index = info.get("file_index")
+        if not torrent or index is None:
+            return None
+        handle = torrent["handle"]
+        ti = handle.torrent_file()
+        if ti is None:
+            return None
+        files = _layout(ti)
+        size = files.file_size(index)
+        offset = files.file_offset(index)
+        piece_length = ti.piece_length()
+        first_piece = offset // piece_length
+        last_piece = (offset + max(0, size - 1)) // piece_length
+        return torrent, handle, index, size, offset, piece_length, first_piece, last_piece
+
+    def focus_episode(self, ep: Dict, offset_seconds: float = 0.0, duration_seconds: float = 0.0) -> None:
+        """Tell the streamer which episode is on screen so the pieces around the
+        playhead (plus container header/trailer) are fetched first."""
+        self._focus = (episode_key(ep), float(offset_seconds or 0), float(duration_seconds or 0))
+        self._apply_focus(*self._focus)
+
+    def clear_focus(self) -> None:
+        self._focus = None
+
+    def _apply_focus(self, key: str, offset_seconds: float, duration_seconds: float) -> None:
+        info = self.episodes.get(key)
+        layout = self._file_layout(info) if info else None
+        if not layout:
+            return
+        _torrent, handle, _index, size, offset, piece_length, first_piece, last_piece = layout
+        fraction = min(max(offset_seconds / duration_seconds, 0.0), 1.0) if duration_seconds > 0 else 0.0
+        start_piece = max(first_piece, min(last_piece, (offset + int(size * fraction)) // piece_length))
+        targets = list(range(first_piece, min(last_piece, first_piece + HEAD_PIECES - 1) + 1))
+        targets += list(range(max(first_piece, last_piece - TAIL_PIECES + 1), last_piece + 1))
+        targets += list(range(start_piece, min(last_piece, start_piece + DEADLINE_WINDOW_PIECES) + 1))
+        seen = set()
+        for order, piece in enumerate(targets):
+            if piece in seen or handle.have_piece(piece):
+                continue
+            seen.add(piece)
+            handle.set_piece_deadline(piece, 500 + order * 150)
+
+    def episode_status(self, ep: Dict, offset_seconds: float = 0.0, duration_seconds: float = 0.0) -> Dict[str, Any]:
+        """Return a status dict: state, ready, progress, file_path, message, etc."""
+        key = episode_key(ep)
+        info = self.episodes.get(key)
+        if info is None:
+            return {"state": "idle", "ready": False, "progress": 0.0, "file_path": None, "message": "Not buffered"}
+        if info["state"] == "error":
+            return {"state": "error", "ready": False, "progress": 0.0, "file_path": None, "message": info["error"] or "Torrent error"}
+        if info["state"] == "resolving" or not info.get("info_hash"):
+            return {"state": "resolving", "ready": False, "progress": 0.0, "file_path": None, "message": "Fetching torrent..."}
+        torrent = self.torrents.get(info["info_hash"])
+        if torrent is None:
+            return {"state": "idle", "ready": False, "progress": 0.0, "file_path": None, "message": "Not buffered"}
+        status = torrent["handle"].status()
+        base = {
+            "download_rate": float(status.download_payload_rate),
+            "peers": int(status.num_peers),
+            "seeds": int(status.num_seeds),
+        }
+        if status.state == lt.torrent_status.states.checking_files:
+            return dict(base, state="checking", ready=False, progress=float(status.progress), file_path=None, message="Checking existing download...")
+        layout = self._file_layout(info)
+        if not layout:
+            return dict(base, state="metadata", ready=False, progress=0.0, file_path=None, message=f"Finding peers... ({base['peers']} connected)")
+        _torrent, handle, index, size, offset, piece_length, first_piece, last_piece = layout
+        file_path = self._file_path(torrent, index)
+        downloaded = int(handle.file_progress(flags=1)[index]) if size else 0
+        have = list(handle.status(lt.status_flags_t.query_pieces).pieces)
+        readiness = compute_readiness(
+            have, first_piece, last_piece, size, piece_length, offset, downloaded,
+            float(offset_seconds or 0), float(duration_seconds or 0), base["download_rate"],
+        )
+        rate_kb = base["download_rate"] / 1024.0
+        if readiness["complete"]:
+            message = "Downloaded"
+        else:
+            message = f"Buffering {readiness['progress'] * 100:.0f}% - {rate_kb:.0f} KB/s from {base['peers']} peers"
+        return dict(
+            base,
+            state="complete" if readiness["complete"] else "downloading",
+            ready=bool(readiness["ready"]) and bool(file_path and os.path.exists(file_path)),
+            complete=readiness["complete"],
+            progress=readiness["progress"],
+            buffered_seconds=readiness["buffered_seconds"],
+            file_path=file_path,
+            message=message,
+        )
 
     def shutdown(self) -> None:
-        # remove all torrents and pause session
+        """Detach all torrents, keeping downloaded files on disk."""
         try:
-            for mag in list(self.torrents.keys()):
-                self.remove_magnet(mag)
+            for info_hash, torrent in list(self.torrents.items()):
+                try:
+                    self.session.remove_torrent(torrent["handle"])
+                except Exception:
+                    logger.debug("Failed to remove %s on shutdown", info_hash)
+            self.torrents.clear()
+            self.episodes.clear()
             logger.info("TorrentStreamer shutdown complete")
         except Exception:
             logger.exception("Error during TorrentStreamer shutdown")

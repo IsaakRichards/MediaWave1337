@@ -1,28 +1,29 @@
 <?xml version="1.0" encoding="utf-8"?>
-<channel name="Twilight Zone">
-  <!-- Episodes are in playback order. Add more <episode> entries as needed. -->
+<channel name="Twilight Zone" number="3" default_duration="25m">
+  <!--
+    One file per channel; episodes air in the order listed, back to back, on a
+    real-time schedule. Leave <magnet> empty and MediaWave1337 looks the episode
+    up on your Jackett/Prowlarr indexer and writes the link back here. <duration>
+    is optional: the real running time is filled in once a file is downloaded.
+    <query> overrides the search text (defaults to <title>).
+  -->
   <episode id="tz-s01e01" season="1" episode="1">
     <title>Twilight Zone S01E01</title>
-    <save_path>data/videos/twilight_zone/s01e01.mp4</save_path>
+    <query>The Twilight Zone 1959 S01E01</query>
     <magnet></magnet>
     <min_seeders>1</min_seeders>
-    <priority>1</priority>
     <note>Prefer 480i/4:3 releases</note>
   </episode>
-
   <episode id="tz-s01e02" season="1" episode="2">
     <title>Twilight Zone S01E02</title>
-    <save_path>data/videos/twilight_zone/s01e02.mp4</save_path>
+    <query>The Twilight Zone 1959 S01E02</query>
     <magnet></magnet>
     <min_seeders>1</min_seeders>
-    <priority>2</priority>
   </episode>
-
   <episode id="tz-s01e03" season="1" episode="3">
     <title>Twilight Zone S01E03</title>
-    <save_path>data/videos/twilight_zone/s01e03.mp4</save_path>
+    <query>The Twilight Zone 1959 S01E03</query>
     <magnet></magnet>
     <min_seeders>1</min_seeders>
-    <priority>3</priority>
   </episode>
 </channel>

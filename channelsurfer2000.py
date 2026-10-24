@@ -33,6 +33,17 @@ from PySide6.QtCore import Qt, QTimer, Slot, QUrl, Signal, QRect, QRectF, QPoint
 from PySide6.QtGui import QPainter, QColor, QIcon, QKeySequence, QShortcut, QPixmap, QFont, QFontDatabase, QLinearGradient, QRadialGradient, QPen, QPolygon, QImage, QFontMetrics, QPainterPath
 from PySide6.QtMultimedia import QMediaPlayer, QAudioOutput, QVideoSink, QSoundEffect, QAudioBufferOutput, QAudioFormat
 from PySide6.QtWebEngineWidgets import QWebEngineView
+
+import torrent_channels
+try:
+    from indexer_client import IndexerClient
+except Exception:  # requests missing
+    IndexerClient = None
+try:
+    from torrent_streamer import TorrentStreamer, TorrentStreamerError
+except Exception:
+    TorrentStreamer = None
+    TorrentStreamerError = Exception
 from PySide6.QtWebEngineCore import QWebEngineSettings
 
 
@@ -489,6 +500,25 @@ SPOTIFY_TRACK_CACHE_FILE = os.path.join(DATA_DIR, "spotify_track_cache.json")
 RADIOWAVE_METADATA_CACHE_FILE = os.path.join(DATA_DIR, "radiowave_metadata_cache.json")
 YOUTUBE_PLAYLIST_CACHE_FILE = os.path.join(DATA_DIR, "youtube_playlist_cache.json")
 CATALOG_VALIDATION_FILE = os.path.join(DATA_DIR, "catalog_validation.json")
+TORRENT_STATE_FILE = os.path.join(DATA_DIR, "torrent_state.json")
+TORRENT_CACHE_DIR = os.path.join(DATA_DIR, "torrent_cache")
+DEFAULT_TORRENT_CHANNELS_DIR = os.path.join(DATA_DIR, "channels")
+DEFAULT_TORRENT_DOWNLOAD_DIR = os.path.join(DATA_DIR, "torrent_downloads")
+
+
+def ensure_default_torrent_channels_dir(path):
+    """Create the torrent channel folder, seeded with the bundled sample channels."""
+    if os.path.isdir(path):
+        return
+    try:
+        os.makedirs(path, exist_ok=True)
+        bundled = os.path.join(RESOURCE_DIR, "channels")
+        if os.path.isdir(bundled) and os.path.realpath(bundled) != os.path.realpath(path):
+            for name in os.listdir(bundled):
+                if name.lower().endswith(".xml"):
+                    shutil.copy2(os.path.join(bundled, name), os.path.join(path, name))
+    except OSError:
+        pass
 CHANNEL_SWITCH_SOUND = os.path.join(RESOURCE_DIR, "assets", "channel_switch.wav")
 APP_LOGO_PATH = resolve_resource_path(
     "logos/MW2K.png",
@@ -1307,6 +1337,8 @@ def catalog_channel_id_from_info(info):
         return "special:radiowave"
     if channel_type == "youtube":
         return "special:youtube"
+    if channel_type == "torrent":
+        return f"torrent:{os.path.realpath(info.get('channel_file', '') or '')}"
     root_path = os.path.realpath(info.get("root_path", "") or "")
     if root_path:
         return f"media:{root_path}"
@@ -3089,7 +3121,7 @@ def pixmap_has_weatherstar_content(pixmap):
     return (max_luma - min_luma) >= 18
 
 
-def draw_nettv_standby_scene(painter, rect, title="", message="", marquee_offset=0):
+def draw_nettv_standby_scene(painter, rect, title="", message="", marquee_offset=0, channel_label="NETTV"):
     if rect is None or rect.isEmpty():
         return
 
@@ -3171,7 +3203,7 @@ def draw_nettv_standby_scene(painter, rect, title="", message="", marquee_offset
         font.setStyleHint(QFont.TypeWriter)
 
     painter.setFont(headline_font)
-    headline = "MEDIAWAVE NETTV NOTICE"
+    headline = f"MEDIAWAVE {channel_label} NOTICE"
     headline_rect = QRect(panel.left() + 20, panel.top() + 24, panel.width() - 40, max(44, panel.height() // 5))
     painter.setPen(QColor(28, 28, 28))
     painter.drawText(headline_rect.translated(3, 3), Qt.AlignCenter | Qt.TextWordWrap, headline)
@@ -3188,7 +3220,7 @@ def draw_nettv_standby_scene(painter, rect, title="", message="", marquee_offset
     painter.setFont(small_font)
     painter.setPen(QColor(245, 245, 245))
     info_lines = [
-        f"CHANNEL: NETTV",
+        f"CHANNEL: {channel_label}",
         f"PROGRAM: {title}",
         f"STATUS: {message}",
     ]
@@ -3201,18 +3233,18 @@ def draw_nettv_standby_scene(painter, rect, title="", message="", marquee_offset
     painter.setPen(QColor(255, 255, 255))
     painter.setFont(small_font)
     now_text = time.strftime("%-I:%M %p") if sys.platform == "darwin" else time.strftime("%I:%M %p").lstrip("0")
-    painter.drawText(top_band.adjusted(18, 0, -18, 0), Qt.AlignLeft | Qt.AlignVCenter, "NETTV SIGNAL ACQUISITION")
+    painter.drawText(top_band.adjusted(18, 0, -18, 0), Qt.AlignLeft | Qt.AlignVCenter, f"{channel_label} SIGNAL ACQUISITION")
     painter.drawText(top_band.adjusted(18, 0, -18, 0), Qt.AlignRight | Qt.AlignVCenter, now_text)
     painter.drawText(bottom_band.adjusted(18, 0, -18, 0), Qt.AlignRight | Qt.AlignVCenter, APP_NAME.upper())
     painter.restore()
 
 
-def make_nettv_standby_pixmap(size, title="", message="Preparing your playlist feed..."):
+def make_nettv_standby_pixmap(size, title="", message="Preparing your playlist feed...", channel_label="NETTV"):
     width = max(1, size.width())
     height = max(1, size.height())
     pixmap = QPixmap(width, height)
     painter = QPainter(pixmap)
-    draw_nettv_standby_scene(painter, pixmap.rect(), title, message, 0)
+    draw_nettv_standby_scene(painter, pixmap.rect(), title, message, 0, channel_label=channel_label)
     painter.end()
     return pixmap
 
@@ -4107,11 +4139,22 @@ def clear_catalog_lookup_caches():
     _LOCAL_ASSET_SIGNATURE_CACHE.clear()
 
 
+def _windows_tool_candidates(name):
+    """Where the setup wizard tells Windows users to put FFmpeg (winget links, or bin\\ next to the app)."""
+    if os.name != "nt":
+        return []
+    return [
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WinGet", "Links", f"{name}.exe"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin", f"{name}.exe"),
+    ]
+
+
 def resolve_ffprobe_path():
     candidates = (
         _bundled_tool_candidates("ffprobe")
         + [
             shutil.which("ffprobe"),
+            *_windows_tool_candidates("ffprobe"),
             "/opt/homebrew/bin/ffprobe",
             "/usr/local/bin/ffprobe",
             "/usr/bin/ffprobe",
@@ -4134,6 +4177,7 @@ def resolve_ffmpeg_path():
         _bundled_tool_candidates("ffmpeg")
         + [
             shutil.which("ffmpeg"),
+            *_windows_tool_candidates("ffmpeg"),
             "/opt/homebrew/bin/ffmpeg",
             "/usr/local/bin/ffmpeg",
             "/usr/bin/ffmpeg",
@@ -8040,6 +8084,81 @@ class RadioWaveChannel(Channel):
                 }
             ]
         return super().get_programs_for_window(window_start, count)
+
+
+class TorrentChannel(Channel):
+    """A channel whose programs are torrent-streamed episodes listed, in airing
+    order, in a channel XML file (see torrent_channels.py)."""
+
+    channel_type = "torrent"
+
+    def __init__(self, channel_info, anchor_time):
+        super().__init__(channel_info["name"], {})
+        self.channel_file = channel_info["path"]
+        self.preferred_number = int(channel_info.get("number") or 0)
+        self.default_duration = float(channel_info.get("default_duration") or torrent_channels.DEFAULT_EPISODE_DURATION)
+        self.start_time = anchor_time
+        self.schedule_anchor = anchor_time
+        self.episodes = []
+        self.update_episodes(channel_info.get("episodes") or [])
+
+    def set_schedule(self, paths, anchor_time):
+        self.schedule_anchor = anchor_time
+
+    @staticmethod
+    def episode_path(ep):
+        quote = urllib.parse.quote
+        return f"torrent://{quote(ep.get('channel', ''), safe='')}/{quote(ep.get('id', ''), safe='')}"
+
+    def episode_duration(self, ep):
+        return max(60.0, float(ep.get("duration") or 0) or self.default_duration)
+
+    def update_episodes(self, episodes):
+        self.episodes = [dict(ep) for ep in episodes]
+        self.schedule_entries = []
+        for ep in self.episodes:
+            duration = self.episode_duration(ep)
+            title = ep.get("title") or ep.get("id") or self.name
+            self.schedule_entries.append(
+                {
+                    "kind": "torrent",
+                    "path": self.episode_path(ep),
+                    "title": title,
+                    "display_title": title,
+                    "summary": ep.get("note", ""),
+                    "duration": duration,
+                    "start_offset": 0.0,
+                    "end_offset": duration,
+                    "torrent_episode": ep,
+                }
+            )
+        self.schedule_paths = [entry["path"] for entry in self.schedule_entries]
+        self.schedule_durations = [entry["duration"] for entry in self.schedule_entries]
+        self.shows = list(self.schedule_paths)
+        self.durations = list(self.schedule_durations)
+
+    def update_episode(self, episode_id, **fields):
+        for ep in self.episodes:
+            if ep.get("id") == episode_id:
+                ep.update(fields)
+                self.update_episodes(self.episodes)
+                return True
+        return False
+
+    def get_current_episode(self):
+        entry, offset = self.get_current_entry_and_offset()
+        if not entry:
+            return None, 0.0, None
+        return entry["torrent_episode"], float(offset or 0), entry
+
+    def upcoming_episodes(self, count):
+        return [item["entry"]["torrent_episode"] for item in self.get_upcoming_programs(count) if item.get("entry")]
+
+    def find_episode_by_path(self, path):
+        for entry in self.schedule_entries:
+            if entry["path"] == path:
+                return entry["torrent_episode"]
+        return None
 
 
 def format_program_title(path):
@@ -17474,6 +17593,7 @@ class NetTVStatusOverlay(QWidget):
         super().__init__(parent)
         self.title = "NetTV"
         self.message = "Preparing channel..."
+        self.channel_label = "NETTV"
         self.marquee_offset = 0
         self.marquee_timer = QTimer(self)
         self.marquee_timer.setInterval(45)
@@ -17482,9 +17602,10 @@ class NetTVStatusOverlay(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground, True)
         self.setFocusPolicy(Qt.NoFocus)
 
-    def show_status(self, title="", message="Preparing NetTV channel"):
+    def show_status(self, title="", message="Preparing NetTV channel", channel_label="NETTV"):
         self.title = (title or "NetTV").strip()
         self.message = (message or "Preparing NetTV channel").strip()
+        self.channel_label = channel_label or "NETTV"
         if not self.marquee_timer.isActive():
             self.marquee_timer.start()
         self.show()
@@ -17506,7 +17627,7 @@ class NetTVStatusOverlay(QWidget):
         display_rect = self.parent().display_rect() if hasattr(self.parent(), "display_rect") else self.rect()
         if display_rect is None or display_rect.isEmpty():
             display_rect = self.rect()
-        draw_nettv_standby_scene(painter, display_rect, self.title, self.message, self.marquee_offset)
+        draw_nettv_standby_scene(painter, display_rect, self.title, self.message, self.marquee_offset, channel_label=self.channel_label)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -18601,7 +18722,7 @@ class VideoWindow(QWidget):
         self.youtube_view.setGeometry(rect)
         self.apply_weather_view_layout()
 
-    def show_nettv_status(self, title="", message="Preparing NetTV channel"):
+    def show_nettv_status(self, title="", message="Preparing NetTV channel", channel_label="NETTV"):
         if self.should_suspend_background_visuals():
             return
         self.nettv_status_overlay.setGeometry(self.video_surface.rect())
@@ -18612,7 +18733,7 @@ class VideoWindow(QWidget):
         self.info_overlay.raise_()
         self.next_up_overlay.raise_()
         self.transport_overlay.raise_()
-        self.nettv_status_overlay.show_status(title, message)
+        self.nettv_status_overlay.show_status(title, message, channel_label=channel_label)
 
     def hide_nettv_status(self):
         self.nettv_status_overlay.hide()
@@ -21805,6 +21926,44 @@ class AdvancedConfigDialog(QDialog):
         self.youtube_enabled = QCheckBox("Enable NetTV playlist channel")
         self.youtube_enabled.setChecked(bool(settings.get("youtube_enabled", False)))
 
+        self.torrent_enabled = QCheckBox("Enable torrent channels")
+        self.torrent_enabled.setChecked(bool(settings.get("torrent_enabled", True)))
+        self.torrent_channels_dir_input = QLineEdit()
+        self.torrent_channels_dir_input.setPlaceholderText(DEFAULT_TORRENT_CHANNELS_DIR)
+        self.torrent_channels_dir_input.setText(settings.get("torrent_channels_dir", ""))
+        self.torrent_channels_dir_btn = QPushButton("Browse")
+        self.torrent_channels_dir_btn.clicked.connect(
+            lambda: self._choose_torrent_folder(self.torrent_channels_dir_input, "Choose Torrent Channels Folder")
+        )
+        self.torrent_download_dir_input = QLineEdit()
+        self.torrent_download_dir_input.setPlaceholderText(DEFAULT_TORRENT_DOWNLOAD_DIR)
+        self.torrent_download_dir_input.setText(settings.get("torrent_download_dir", ""))
+        self.torrent_download_dir_btn = QPushButton("Browse")
+        self.torrent_download_dir_btn.clicked.connect(
+            lambda: self._choose_torrent_folder(self.torrent_download_dir_input, "Choose Torrent Download Folder")
+        )
+        self.torrent_indexer_url_input = QLineEdit()
+        self.torrent_indexer_url_input.setPlaceholderText("http://localhost:9117 (Jackett) or http://localhost:9696 (Prowlarr)")
+        self.torrent_indexer_url_input.setText(settings.get("torrent_indexer_url", ""))
+        self.torrent_indexer_key_input = QLineEdit()
+        self.torrent_indexer_key_input.setEchoMode(QLineEdit.Password)
+        self.torrent_indexer_key_input.setText(settings.get("torrent_indexer_api_key", ""))
+        self.torrent_provider_combo = QComboBox()
+        self.torrent_provider_combo.addItems(["Auto", "Jackett", "Prowlarr"])
+        provider = str(settings.get("torrent_indexer_provider", "auto") or "auto").lower()
+        self.torrent_provider_combo.setCurrentIndex({"jackett": 1, "prowlarr": 2}.get(provider, 0))
+        self.torrent_buffer_spin = QSpinBox()
+        self.torrent_buffer_spin.setRange(1, 10)
+        self.torrent_buffer_spin.setValue(int(settings.get("torrent_buffer_episodes", 3) or 3))
+        self.torrent_keep_downloads = QCheckBox("Keep downloaded episodes after they leave the buffer")
+        self.torrent_keep_downloads.setChecked(bool(settings.get("torrent_keep_downloads", False)))
+        self.torrent_backend_help = QLabel(
+            "Each XML file in the channels folder is one channel. Episodes without a magnet link are looked up on your indexer. "
+            + ("libtorrent is installed." if TorrentStreamer is not None else "libtorrent is NOT installed: run pip install libtorrent.")
+        )
+        self.torrent_backend_help.setObjectName("fieldHelp")
+        self.torrent_backend_help.setWordWrap(True)
+
         self.allow_empty_catalog_tv = QCheckBox("Allow Live TV with no catalog")
         self.allow_empty_catalog_tv.setChecked(bool(settings.get("allow_empty_catalog_tv", False)))
         self.allow_dummy_vault_catalog = QCheckBox("Allow MediaWave Vault with no catalog")
@@ -22061,6 +22220,26 @@ class AdvancedConfigDialog(QDialog):
         companion_layout.addWidget(self.radiowave_enabled)
         companion_layout.addWidget(self.youtube_enabled)
         layout.addWidget(companion_card)
+
+        torrent_card, torrent_layout = self.build_section_card(
+            "Torrent Channels",
+            "Channels streamed from BitTorrent releases found on a local Jackett or Prowlarr indexer.",
+        )
+        torrent_form = QFormLayout()
+        torrent_form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
+        torrent_form.setHorizontalSpacing(16)
+        torrent_form.setVerticalSpacing(12)
+        torrent_form.addRow(self._label("Channels Folder"), self._build_row_wrapper(self.torrent_channels_dir_input, self.torrent_channels_dir_btn))
+        torrent_form.addRow(self._label("Download Folder"), self._build_row_wrapper(self.torrent_download_dir_input, self.torrent_download_dir_btn))
+        torrent_form.addRow(self._label("Indexer URL"), self.torrent_indexer_url_input)
+        torrent_form.addRow(self._label("Indexer API Key"), self.torrent_indexer_key_input)
+        torrent_form.addRow(self._label("Indexer Type"), self.torrent_provider_combo)
+        torrent_form.addRow(self._label("Episodes to Buffer"), self.torrent_buffer_spin)
+        torrent_layout.addLayout(torrent_form)
+        torrent_layout.addWidget(self.torrent_backend_help)
+        torrent_layout.addWidget(self.torrent_enabled)
+        torrent_layout.addWidget(self.torrent_keep_downloads)
+        layout.addWidget(torrent_card)
 
         # MediaWave Alert System card
         alert_card, alert_layout = self.build_section_card(
@@ -22839,6 +23018,14 @@ class AdvancedConfigDialog(QDialog):
             "youtube_playlist_url": self.youtube_playlist_input.text().strip(),
             "youtube_channel_number": self.youtube_channel_input.value(),
             "youtube_enabled": self.youtube_enabled.isChecked(),
+            "torrent_enabled": self.torrent_enabled.isChecked(),
+            "torrent_channels_dir": self.torrent_channels_dir_input.text().strip(),
+            "torrent_download_dir": self.torrent_download_dir_input.text().strip(),
+            "torrent_indexer_url": self.torrent_indexer_url_input.text().strip(),
+            "torrent_indexer_api_key": self.torrent_indexer_key_input.text().strip(),
+            "torrent_indexer_provider": ["auto", "jackett", "prowlarr"][self.torrent_provider_combo.currentIndex()],
+            "torrent_buffer_episodes": self.torrent_buffer_spin.value(),
+            "torrent_keep_downloads": self.torrent_keep_downloads.isChecked(),
             "nettv_cookies_browser": (
                 nettv_available_cookie_browsers()[self.nettv_cookies_browser_combo.currentIndex()]
                 if self.nettv_cookies_browser_enabled.isChecked()
@@ -22854,6 +23041,12 @@ class AdvancedConfigDialog(QDialog):
             "catalog_channel_settings": self.collect_catalog_channel_settings(),
             "channel_bug": self._collect_channel_bug_settings(),
         }
+
+    def _choose_torrent_folder(self, line_edit, title):
+        start_dir = existing_picker_start(line_edit.text().strip(), line_edit.placeholderText())
+        folder = QFileDialog.getExistingDirectory(self, title, start_dir)
+        if folder:
+            line_edit.setText(os.path.abspath(os.path.expanduser(folder)))
 
     def choose_radiowave_folder(self):
         start_dir = existing_picker_start(
@@ -23644,6 +23837,8 @@ class ChannelSurfer(QWidget):
     youtubeStreamResolved = Signal(int, dict, str, str, float)
     youtubePlaylistLoaded = Signal(int, str, list, str)
     episodeThumbnailReady = Signal(str)
+    torrentMagnetResolved = Signal(dict, str, str)
+    torrentDurationProbed = Signal(str, str, float)
 
     def __init__(self):
         super().__init__()
@@ -23669,6 +23864,15 @@ class ChannelSurfer(QWidget):
                 "youtube_playlist_url": "",
                 "youtube_channel_number": 1,
                 "youtube_enabled": False,
+                "torrent_enabled": True,
+                "torrent_channels_dir": "",
+                "torrent_download_dir": "",
+                "torrent_indexer_url": "http://localhost:9117",
+                "torrent_indexer_api_key": "",
+                "torrent_indexer_provider": "auto",
+                "torrent_buffer_episodes": 3,
+                "torrent_keep_downloads": False,
+                "torrent_listen_port": 6881,
                 "allow_empty_catalog_tv": False,
                 "allow_dummy_vault_catalog": False,
                 "dev_menu_enabled": False,
@@ -24113,6 +24317,17 @@ class ChannelSurfer(QWidget):
         self.nettv_pending_play_after_seek = False
         self.nettv_prefetch_active = False
         self.nettv_prefetch_generation = 0
+        self.torrent_streamer = None
+        self.torrent_resolver = None
+        self.torrent_backend_error = ""
+        self.torrent_state = load_json_file(TORRENT_STATE_FILE, {})
+        self.torrent_waiting = None
+        self.torrent_playing = None
+        self.torrent_slate_message = ""
+        self.torrent_last_window_update = 0.0
+        self.torrent_window_keys = []
+        self.torrent_failures = {}
+        self.torrent_probed = set()
         self.pending_offset = 0
         self.pending_seek_ms = 0
         self.pending_play_after_seek = False
@@ -24206,6 +24421,11 @@ class ChannelSurfer(QWidget):
         self.live_stall_timer = QTimer(self)
         self.live_stall_timer.setInterval(2000)
         self.live_stall_timer.timeout.connect(self.check_live_playback_health)
+        self.torrent_tick_timer = QTimer(self)
+        self.torrent_tick_timer.setInterval(1000)
+        self.torrent_tick_timer.timeout.connect(self.torrent_tick)
+        self.torrentMagnetResolved.connect(self.on_torrent_magnet_resolved)
+        self.torrentDurationProbed.connect(self.on_torrent_duration_probed)
         self.youtubeStreamResolved.connect(self.on_youtube_stream_resolved)
         self.youtubePlaylistLoaded.connect(self.on_youtube_playlist_loaded_for_tune)
         self.episodeThumbnailReady.connect(self.on_episode_thumbnail_ready)
@@ -24253,7 +24473,7 @@ class ChannelSurfer(QWidget):
             saved = (self.app_settings.get("catalog_path") or "").strip()
             if saved and safe_isdir(saved):
                 self.load_catalog(saved, autoplay=False)
-            if not self.channels and self.app_settings.get("allow_empty_catalog_tv"):
+            if not self.channels and (self.app_settings.get("allow_empty_catalog_tv") or self.torrent_channels_available()):
                 self.channels = []
                 self.loaded_media_channels = []
                 self.current_channel = 0
@@ -24261,7 +24481,7 @@ class ChannelSurfer(QWidget):
                 self.apply_catalog_channel_customizations()
                 self.refresh_controls()
                 if not self.channels:
-                    self.status.setText("Enable WeatherStar, RadioWaveTV, or a NetTV playlist channel to Watch TV without local content.")
+                    self.status.setText("Add torrent channel XML files, or enable WeatherStar, RadioWaveTV, or a NetTV playlist channel to Watch TV without local content.")
                     return
             elif not self.channels and not self.browse_catalog():
                 return
@@ -24544,6 +24764,8 @@ class ChannelSurfer(QWidget):
             return "special:radiowave"
         if channel_type == "youtube":
             return "special:youtube"
+        if channel_type == "torrent":
+            return f"torrent:{os.path.realpath(getattr(channel, 'channel_file', '') or '')}"
         root_path = os.path.realpath(getattr(channel, "root_path", "") or "")
         if root_path:
             return f"media:{root_path}"
@@ -24576,6 +24798,7 @@ class ChannelSurfer(QWidget):
                     "name": getattr(channel, "name", "Channel"),
                     "channel_type": getattr(channel, "channel_type", "media"),
                     "root_path": getattr(channel, "root_path", ""),
+                    "channel_file": getattr(channel, "channel_file", ""),
                     "default_number": self.channel_display_number(index, channel),
                 }
             )
@@ -24625,7 +24848,7 @@ class ChannelSurfer(QWidget):
             except (TypeError, ValueError):
                 display_number = 0
             if display_number <= 0:
-                display_number = index + 1
+                display_number = int(getattr(channel, "preferred_number", 0) or 0) or index + 1
             category = self.catalog_category_for_channel(channel)
             setattr(channel, "catalog_channel_id", channel_id)
             setattr(channel, "display_number", display_number)
@@ -24666,6 +24889,7 @@ class ChannelSurfer(QWidget):
             "FFmpeg": "found" if resolve_ffmpeg_path() else "missing",
             "FFprobe": "found" if resolve_ffprobe_path() else "missing",
             "yt-dlp": "found" if resolve_ytdlp_command() else "missing",
+            "libtorrent": "found" if TorrentStreamer is not None else "missing",
         }
 
     def _nettv_auth_mode_label(self):
@@ -24894,6 +25118,14 @@ class ChannelSurfer(QWidget):
         self.app_settings["youtube_playlist_url"] = values["youtube_playlist_url"]
         self.app_settings["youtube_channel_number"] = values["youtube_channel_number"]
         self.app_settings["youtube_enabled"] = values["youtube_enabled"]
+        torrent_keys = (
+            "torrent_enabled", "torrent_channels_dir", "torrent_download_dir", "torrent_indexer_url",
+            "torrent_indexer_api_key", "torrent_indexer_provider", "torrent_buffer_episodes", "torrent_keep_downloads",
+        )
+        if any(self.app_settings.get(key) != values[key] for key in torrent_keys):
+            for key in torrent_keys:
+                self.app_settings[key] = values[key]
+            self.shutdown_torrent_backend()
         self.app_settings["nettv_cookies_browser"] = values.get("nettv_cookies_browser", "")
         self.app_settings["nettv_cookies_file"] = values.get("nettv_cookies_file", "")
         self.app_settings["allow_empty_catalog_tv"] = values["allow_empty_catalog_tv"]
@@ -27219,6 +27451,378 @@ class ChannelSurfer(QWidget):
             if changed_channel:
                 channel.update_entries(updated_entries)
 
+    # ---------------- Torrent channels ---------------- #
+
+    def torrent_channels_dir(self):
+        configured = (self.app_settings.get("torrent_channels_dir") or "").strip()
+        if configured:
+            return os.path.abspath(os.path.expanduser(configured))
+        ensure_default_torrent_channels_dir(DEFAULT_TORRENT_CHANNELS_DIR)
+        return DEFAULT_TORRENT_CHANNELS_DIR
+
+    def torrent_download_dir(self):
+        configured = (self.app_settings.get("torrent_download_dir") or "").strip()
+        return os.path.abspath(os.path.expanduser(configured)) if configured else DEFAULT_TORRENT_DOWNLOAD_DIR
+
+    def torrent_channels_available(self):
+        if not self.app_settings.get("torrent_enabled", True):
+            return False
+        return bool(torrent_channels.list_channel_files(self.torrent_channels_dir()))
+
+    def torrent_channel_anchor(self, name):
+        """Persisted schedule start, so a channel keeps its place across restarts
+        (and starts at its first episode the first time it is seen)."""
+        anchors = self.torrent_state.setdefault("anchors", {})
+        if name not in anchors:
+            anchors[name] = time.time()
+            save_json_file(TORRENT_STATE_FILE, self.torrent_state)
+        return float(anchors[name])
+
+    def configured_torrent_channels(self):
+        if not self.app_settings.get("torrent_enabled", True):
+            return []
+        channels = []
+        for info in torrent_channels.load_channels_dir(self.torrent_channels_dir()):
+            if info["episodes"]:
+                channels.append(TorrentChannel(info, self.torrent_channel_anchor(info["name"])))
+        if channels:
+            self.ensure_torrent_backend()
+            if self.torrent_resolver is not None:
+                for channel in channels:
+                    for ep in channel.episodes:
+                        self.torrent_resolver.request(ep)
+        return channels
+
+    def ensure_torrent_backend(self):
+        if self.torrent_streamer is None and not self.torrent_backend_error:
+            if TorrentStreamer is None:
+                self.torrent_backend_error = "libtorrent is not installed. Run: pip install libtorrent"
+            else:
+                try:
+                    self.torrent_streamer = TorrentStreamer(
+                        save_root=self.torrent_download_dir(),
+                        listen_port=int(self.app_settings.get("torrent_listen_port", 6881) or 6881),
+                        torrent_cache_dir=TORRENT_CACHE_DIR,
+                        delete_evicted=not self.app_settings.get("torrent_keep_downloads", False),
+                    )
+                except Exception as exc:
+                    self.torrent_backend_error = f"Torrent engine failed to start: {exc}"
+                    startup_log(self.torrent_backend_error)
+        url = (self.app_settings.get("torrent_indexer_url") or "").strip()
+        if self.torrent_resolver is None and url and IndexerClient is not None:
+            provider = str(self.app_settings.get("torrent_indexer_provider", "auto") or "auto").lower()
+            indexer = IndexerClient(
+                url,
+                api_key=(self.app_settings.get("torrent_indexer_api_key") or "").strip() or None,
+                provider_hint=provider if provider in ("jackett", "prowlarr") else None,
+            )
+            self.torrent_resolver = torrent_channels.MagnetResolver(
+                indexer,
+                callback=lambda ep, link, error: self.torrentMagnetResolved.emit(dict(ep), link or "", error or ""),
+            )
+        if self.torrent_streamer is not None or self.torrent_resolver is not None:
+            self.torrent_tick_timer.start()
+
+    def shutdown_torrent_backend(self):
+        self.torrent_tick_timer.stop()
+        if self.torrent_resolver is not None:
+            self.torrent_resolver.stop()
+            self.torrent_resolver = None
+        if self.torrent_streamer is not None:
+            self.torrent_streamer.shutdown()
+            self.torrent_streamer = None
+        self.torrent_backend_error = ""
+        self.torrent_waiting = None
+        self.torrent_playing = None
+        self.torrent_window_keys = []
+
+    def current_torrent_channel(self):
+        if not self.channels:
+            return None
+        channel = self.channels[self.current_channel % len(self.channels)]
+        if getattr(channel, "channel_type", "media") == "torrent":
+            return channel
+        return None
+
+    def torrent_channel_window(self):
+        """The current channel and the ones directly above and below it."""
+        if not self.channels:
+            return []
+        count = len(self.channels)
+        index = self.current_channel % count
+        window = []
+        for i in (index, (index + 1) % count, (index - 1) % count):
+            channel = self.channels[i]
+            if getattr(channel, "channel_type", "media") == "torrent" and channel not in window:
+                window.append(channel)
+        return window
+
+    def update_torrent_buffer_window(self):
+        if self.torrent_streamer is None and self.torrent_resolver is None:
+            return
+        count = max(1, int(self.app_settings.get("torrent_buffer_episodes", 3) or 3))
+        episodes = []
+        for channel in self.torrent_channel_window():
+            for ep in channel.upcoming_episodes(count):
+                if self.torrent_resolver is not None and not ep.get("magnet"):
+                    self.torrent_resolver.request(ep, urgent=True)
+                episodes.append(ep)
+        self.torrent_last_window_update = time.time()
+        self.torrent_window_keys = [ep["key"] for ep in episodes]
+        if self.torrent_streamer is None:
+            return
+        try:
+            self.torrent_streamer.buffer_episodes(episodes)
+        except Exception:
+            startup_log(f"torrent buffer update failed:\n{traceback.format_exc()}")
+        for ep in episodes:
+            if ep["key"] in self.torrent_probed or not ep.get("magnet"):
+                continue
+            status = self.torrent_streamer.episode_status(ep)
+            if status.get("complete") and status.get("file_path"):
+                self.queue_torrent_probe(ep, status["file_path"])
+
+    def torrent_episode_status(self, ep, offset=0.0, duration=0.0):
+        if not ep.get("magnet"):
+            if self.torrent_resolver is None:
+                message = "No release yet. Set an indexer in Advanced Config > Torrent Channels."
+            elif self.torrent_resolver.is_pending(ep):
+                message = "Searching the indexer for a release..."
+            elif self.torrent_resolver.has_failed(ep):
+                message = "No release was found for this episode."
+            else:
+                message = "Waiting for the indexer..."
+            return {"state": "no-magnet", "ready": False, "message": message}
+        if self.torrent_streamer is None:
+            return {"state": "error", "ready": False, "message": self.torrent_backend_error or "Torrent engine is not running."}
+        return self.torrent_streamer.episode_status(ep, offset, duration)
+
+    def find_torrent_episode_by_path(self, path):
+        for channel in self.channels:
+            if getattr(channel, "channel_type", "media") != "torrent":
+                continue
+            ep = channel.find_episode_by_path(path)
+            if ep is not None:
+                return ep
+        return None
+
+    def show_torrent_slate(self, channel, title, message):
+        label = (getattr(channel, "name", "") or "Torrent").upper()
+        display_rect = self.video_window.video_surface.display_rect()
+        if display_rect is None or display_rect.isEmpty():
+            surface_rect = self.video_window.video_surface.rect()
+            display_rect = surface_rect if not surface_rect.isEmpty() else QRect(0, 0, max(960, self.video_window.width()), max(540, self.video_window.height()))
+        pixmap = make_nettv_standby_pixmap(display_rect.size(), title, message, channel_label=label)
+        self.last_video_frame = pixmap
+        self.video_window.video_surface.set_frame(pixmap)
+        self.video_window.video_surface.show()
+        self.video_window.show_nettv_status(title, message, channel_label=label)
+        self.torrent_slate_message = message
+
+    def play_torrent_channel(self, ch, with_transition, show_channel_overlay, is_program_advance, should_activate):
+        display_number = self.channel_display_number(self.current_channel, ch)
+        previous_frame = self.capture_current_frame()
+        previous_playing = self.torrent_playing
+        self.stop_player()
+        self.playback_mode = "live"
+        self.current_on_demand_path = None
+        self.hide_info_banner()
+        self.torrent_playing = None
+        self.torrent_waiting = None
+
+        screen = self.screen() or QApplication.primaryScreen()
+        if screen is not None:
+            self.video_window.setGeometry(screen.geometry())
+        self.video_window.show()
+        self.video_window.showFullScreen()
+        if should_activate:
+            self.video_window.raise_()
+            self.video_window.activateWindow()
+            self.video_window.setFocus(Qt.ActiveWindowFocusReason)
+        if self.video_window.guide_overlay.isVisible():
+            self.refresh_guide()
+        if self.video_window.on_demand_overlay.isVisible():
+            self.refresh_on_demand()
+            if not is_program_advance:
+                self.video_window.on_demand_overlay.hide()
+        if with_transition:
+            self.video_window.static.trigger(previous_frame)
+            self.switch_sound.stop()
+            self.switch_sound.play()
+        if show_channel_overlay:
+            self.video_window.channel_overlay.show_channel(display_number, ch.name)
+        self.configure_channel_bug(ch, is_program_advance=is_program_advance)
+
+        self.update_torrent_buffer_window()
+        ep, offset, entry = ch.get_current_episode()
+        if ep is None:
+            self.show_torrent_slate(ch, ch.name, "This channel has no episodes.")
+            return
+        title = entry.get("title") or ch.name
+        duration = float(entry.get("duration") or 0)
+        self.status.setText(f"Channel {display_number}/{len(self.channels)}: {ch.name}\n{title}")
+
+        slot_end = time.time() + max(0.0, duration - offset)
+        if is_program_advance and previous_playing and previous_playing.get("key") == ep["key"] and offset > 5.0:
+            # The file ended before its scheduled slot did: stand by for the next program.
+            upcoming = ch.get_upcoming_programs(2)
+            next_title = upcoming[1]["title"] if len(upcoming) > 1 else ch.name
+            self.show_torrent_slate(ch, f"Up next: {next_title}", "The next program starts shortly.")
+            self.torrent_waiting = {"key": ep["key"], "retry_after": slot_end}
+            return
+
+        status = self.torrent_episode_status(ep, offset, duration)
+        if self.torrent_streamer is not None:
+            self.torrent_streamer.focus_episode(ep, offset, duration)
+        if not status.get("ready") or (self.torrent_failures.get(ep["key"], 0) >= 2 and not status.get("complete")):
+            self.show_torrent_slate(ch, title, status.get("message") or "Tuning in...")
+            self.torrent_waiting = {"key": ep["key"], "retry_after": 0.0}
+            return
+
+        self.torrent_playing = {"key": ep["key"], "ep": ep, "file_path": status["file_path"], "duration_recorded": False}
+        self.pending_video = status["file_path"]
+        self.pending_video_is_url = False
+        self.pending_offset = offset
+        self.channel_switch_timer.start(165 if with_transition else 10)
+
+    def handle_torrent_playback_failure(self, reason):
+        channel = self.current_torrent_channel()
+        playing = self.torrent_playing or {}
+        key = playing.get("key")
+        self.live_stall_timer.stop()
+        self.live_stall_path = ""
+        self.media_player.stop()
+        self.torrent_playing = None
+        if channel is None or not key:
+            return
+        failures = self.torrent_failures.get(key, 0) + 1
+        self.torrent_failures[key] = failures
+        ep = playing.get("ep") or {}
+        title = ep.get("title") or channel.name
+        startup_log(f"torrent playback failure #{failures} for {key}: {reason}")
+        if failures >= 3:
+            status = self.torrent_episode_status(ep)
+            if status.get("complete"):
+                # Broken release: sit out the rest of its slot instead of retrying.
+                _ep, offset, entry = channel.get_current_episode()
+                slot_end = time.time() + max(0.0, float((entry or {}).get("duration") or 0) - offset)
+                self.show_torrent_slate(channel, title, "This episode could not be played. Please stand by.")
+                self.torrent_waiting = {"key": key, "retry_after": slot_end}
+                return
+        self.show_torrent_slate(channel, title, "Signal lost - rebuffering...")
+        self.torrent_waiting = {"key": key, "retry_after": time.time() + 8.0 * failures}
+
+    def record_torrent_duration(self, ep, seconds):
+        seconds = float(seconds or 0)
+        if seconds < 60 or abs(seconds - float(ep.get("duration") or 0)) < 3:
+            return
+        try:
+            torrent_channels.update_episode_fields(ep["channel_file"], ep["id"], {"duration": torrent_channels.format_duration(seconds)})
+        except Exception:
+            startup_log(f"could not save duration for {ep.get('key')}:\n{traceback.format_exc()}")
+        for channel in self.channels:
+            if getattr(channel, "channel_type", "media") == "torrent" and channel.channel_file == ep["channel_file"]:
+                channel.update_episode(ep["id"], duration=seconds)
+        ep["duration"] = seconds
+        self.guide_rows_cache = {}
+
+    def queue_torrent_probe(self, ep, file_path):
+        if not FFPROBE_PATH or ep["key"] in self.torrent_probed:
+            return
+        self.torrent_probed.add(ep["key"])
+        channel_file, episode_id = ep["channel_file"], ep["id"]
+
+        def worker():
+            try:
+                result = subprocess.run(
+                    [FFPROBE_PATH, "-v", "error", "-show_entries", "format=duration",
+                     "-of", "default=noprint_wrappers=1:nokey=1", file_path],
+                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=30,
+                )
+                seconds = float(result.stdout.decode().strip() or 0)
+            except Exception:
+                return
+            if seconds > 0:
+                self.torrentDurationProbed.emit(channel_file, episode_id, seconds)
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    @Slot(str, str, float)
+    def on_torrent_duration_probed(self, channel_file, episode_id, seconds):
+        if self._closing:
+            return
+        for channel in self.channels:
+            if getattr(channel, "channel_type", "media") != "torrent" or channel.channel_file != channel_file:
+                continue
+            for ep in channel.episodes:
+                if ep["id"] == episode_id:
+                    self.record_torrent_duration(ep, seconds)
+                    return
+
+    @Slot(dict, str, str)
+    def on_torrent_magnet_resolved(self, ep, link, error):
+        if self._closing or not link:
+            return
+        for channel in self.channels:
+            if getattr(channel, "channel_type", "media") == "torrent" and channel.channel_file == ep.get("channel_file"):
+                channel.update_episode(ep["id"], magnet=link)
+        if ep.get("key") in self.torrent_window_keys:
+            self.update_torrent_buffer_window()
+
+    def torrent_tick(self):
+        if self._closing:
+            return
+        streamer = self.torrent_streamer
+        if streamer is not None:
+            try:
+                streamer.poll()
+            except Exception:
+                startup_log(f"torrent poll failed:\n{traceback.format_exc()}")
+        now = time.time()
+        if now - self.torrent_last_window_update >= 20.0:
+            self.update_torrent_buffer_window()
+        channel = self.current_torrent_channel()
+        if channel is None and (self.torrent_waiting or self.torrent_playing):
+            self.torrent_waiting = None
+            self.torrent_playing = None
+            if streamer is not None:
+                streamer.clear_focus()
+        if channel is None or self.playback_mode != "live" or not self.video_window.isVisible():
+            return
+
+        if self.torrent_waiting:
+            ep, offset, entry = channel.get_current_episode()
+            if ep is None:
+                return
+            if ep["key"] != self.torrent_waiting.get("key"):
+                self.play_channel(with_transition=False, show_channel_overlay=False, is_program_advance=True)
+                return
+            duration = float(entry.get("duration") or 0)
+            if streamer is not None:
+                streamer.focus_episode(ep, offset, duration)
+            if now < self.torrent_waiting.get("retry_after", 0.0):
+                if not self.video_window.nettv_status_overlay.isVisible():
+                    self.show_torrent_slate(channel, entry.get("title") or channel.name, self.torrent_slate_message)
+                return
+            status = self.torrent_episode_status(ep, offset, duration)
+            needs_complete = self.torrent_failures.get(ep["key"], 0) >= 2
+            if status.get("ready") and (status.get("complete") or not needs_complete):
+                self.play_channel(with_transition=False, show_channel_overlay=False, is_program_advance=True)
+                return
+            message = status.get("message") or "Tuning in..."
+            if message != self.torrent_slate_message or not self.video_window.nettv_status_overlay.isVisible():
+                self.show_torrent_slate(channel, entry.get("title") or channel.name, message)
+            return
+
+        playing = self.torrent_playing
+        if playing and streamer is not None:
+            duration_ms = int(self.media_player.duration())
+            position = max(0.0, self.media_player.position() / 1000.0)
+            streamer.focus_episode(playing["ep"], position, duration_ms / 1000.0 if duration_ms > 0 else 0.0)
+            if duration_ms > 0 and not playing["duration_recorded"]:
+                playing["duration_recorded"] = True
+                self.record_torrent_duration(playing["ep"], duration_ms / 1000.0)
+
     def configured_youtube_channel(self):
         if not self.app_settings.get("youtube_enabled"):
             return None
@@ -27295,6 +27899,7 @@ class ChannelSurfer(QWidget):
         if youtube_channel:
             special_channels.append((int(self.app_settings.get("youtube_channel_number", 1) or 1), youtube_channel))
         self.channels = list(base_channels)
+        self.channels.extend(self.configured_torrent_channels())
         for desired_number, channel in sorted(special_channels, key=lambda item: item[0]):
             insert_index = max(0, min(len(self.channels), desired_number - 1))
             self.channels.insert(insert_index, channel)
@@ -27867,6 +28472,10 @@ class ChannelSurfer(QWidget):
             self.channel_switch_timer.start(165 if with_transition else 10)
             return
 
+        if getattr(ch, "channel_type", "media") == "torrent":
+            self.play_torrent_channel(ch, with_transition, show_channel_overlay, is_program_advance, _should_activate)
+            return
+
         video, offset = ch.get_current()
 
         if not video:
@@ -28239,6 +28848,9 @@ class ChannelSurfer(QWidget):
 
     def recover_live_playback_failure(self, reason):
         if self.playback_mode != "live":
+            return
+        if self.current_torrent_channel() is not None:
+            self.handle_torrent_playback_failure(reason)
             return
 
         failed_path = self.live_stall_path or self.media_player.source().toLocalFile()
@@ -28677,7 +29289,9 @@ class ChannelSurfer(QWidget):
         )
         radiowave_ready = bool(self.app_settings.get("radiowave_enabled"))
         youtube_ready = bool(self.app_settings.get("youtube_enabled")) and bool(youtube_source_url(self.app_settings.get("youtube_playlist_url", "")))
-        special_only_ready = bool(self.app_settings.get("allow_empty_catalog_tv")) and bool(weather_ready or radiowave_ready or youtube_ready)
+        special_only_ready = (
+            bool(self.app_settings.get("allow_empty_catalog_tv")) and bool(weather_ready or radiowave_ready or youtube_ready)
+        ) or self.torrent_channels_available()
         self.watch_btn.setEnabled(has_channels or saved_catalog_ready or special_only_ready)
         self.library_summary.setText(
             f"{len(self.channels)} channel{'s' if len(self.channels) != 1 else ''} loaded"
@@ -28848,6 +29462,20 @@ class ChannelSurfer(QWidget):
                 "detail_summary": summary,
                 "show_name": source_label,
                 "match_key": "spotify-radio",
+                "tmdb_matched": False,
+            }
+        if isinstance(path, str) and path.startswith("torrent://"):
+            ep = self.find_torrent_episode_by_path(path) or {}
+            title = ep.get("title") or "Torrent Channel"
+            return {
+                "signature": stable_hash(path + title),
+                "path": path,
+                "media_type": "special",
+                "timeline_title": title,
+                "detail_title": title,
+                "detail_summary": ep.get("note") or f"Streaming on {ep.get('channel') or 'this channel'}.",
+                "show_name": ep.get("channel") or "Torrent Channel",
+                "match_key": "torrent-channel",
                 "tmdb_matched": False,
             }
         if isinstance(path, str) and path.startswith("youtube://"):
@@ -30712,7 +31340,7 @@ class ChannelSurfer(QWidget):
             return {}
         actions = ["VIEW SHOW VAULT"]
         current_channel = self.channels[self.current_channel] if self.channels and 0 <= self.current_channel < len(self.channels) else None
-        if getattr(current_channel, "channel_type", "media") in ("weatherstar", "radiowave", "youtube"):
+        if getattr(current_channel, "channel_type", "media") in ("weatherstar", "radiowave", "youtube", "torrent"):
             actions = []
         channel_root = getattr(current_channel, "root_path", "") or ""
         return {
@@ -32497,6 +33125,7 @@ class ChannelSurfer(QWidget):
         self.youtube_stream_generation += 1
         self.youtube_playlist_loads_in_flight.clear()
         self.stop_player()
+        self.shutdown_torrent_backend()
         self.sleep_preventer.release()
         self.stop_radiowave_background()
         self.video_window.static.hide()

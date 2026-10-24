@@ -1,4 +1,7 @@
-# requirements for development and runtime
+# Runtime
+PySide6>=6.5
 requests
-python-libtorrent
+libtorrent>=2.0   # PyPI wheel name; on Debian/Ubuntu `apt install python3-libtorrent` also works
+
+# Development
 pytest

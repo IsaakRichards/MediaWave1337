@@ -16,6 +16,7 @@ datas = (
     + _dir_if_exists("Fonts", "Fonts")
     + _dir_if_exists("docs", "docs")
     + _dir_if_exists("bin", "bin")
+    + _dir_if_exists("channels", "channels")
 )
 
 _icon_icns = os.path.join(_base, "icons", "mediawave2000.icns")
@@ -31,7 +32,7 @@ a = Analysis(
     pathex=[_base],
     binaries=[],
     datas=datas,
-    hiddenimports=["yt_dlp"],
+    hiddenimports=["yt_dlp", "libtorrent", "torrent_channels", "torrent_streamer", "indexer_client"],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[os.path.join(_base, "hooks", "pyi_rth_qtwebengine.py")],
