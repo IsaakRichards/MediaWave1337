@@ -62,3 +62,45 @@ def test_min_seeders_filters_everything_raises():
     with mock.patch("indexer_client.requests.get", return_value=_response(results)):
         with pytest.raises(NoMagnetFound):
             IndexerClient("http://localhost:9117").get_best_magnet("Show", min_seeders=2)
+
+
+def test_exclude_skips_rejected_links_and_runs_out():
+    results = {"Results": [
+        {"Title": "Show S01E01 DVDRip", "Seeders": 10, "MagnetUri": "magnet:?xt=urn:btih:BEST"},
+        {"Title": "Show S01E01 SDTV", "Seeders": 10, "MagnetUri": "magnet:?xt=urn:btih:NEXT"},
+    ]}
+    with mock.patch("indexer_client.requests.get", return_value=_response(results)):
+        c = IndexerClient("http://localhost:9117")
+        assert c.get_best_magnet("Show") == "magnet:?xt=urn:btih:BEST"
+        assert c.get_best_magnet("Show", exclude=["magnet:?xt=urn:btih:BEST"]) == "magnet:?xt=urn:btih:NEXT"
+        with pytest.raises(NoMagnetFound, match="untried"):
+            c.get_best_magnet("Show", exclude=["magnet:?xt=urn:btih:BEST", "magnet:?xt=urn:btih:NEXT"])
+
+
+def test_unreachable_indexer_raises_unavailable():
+    import requests
+    from indexer_client import IndexerUnavailable
+    with mock.patch("indexer_client.requests.get", side_effect=requests.ConnectionError("refused")):
+        with pytest.raises(IndexerUnavailable):
+            IndexerClient("http://localhost:9117").get_best_magnet("Show")
+
+
+def test_general_categories_fallback_only_when_sd_finds_nothing():
+    from indexer_client import GENERAL_CATEGORIES
+
+    def fake_get(url, params=None, timeout=None, **kw):
+        cats = {v for k, v in params if k == "Category[]"}
+        if cats == {"5030", "2030"}:
+            return _response({"Results": []})
+        return _response({"Results": [
+            {"Title": "Show S01E01 720p", "Seeders": 90, "MagnetUri": "magnet:?xt=urn:btih:HD"},
+            {"Title": "Show S01E01 DVDRip", "Seeders": 3, "MagnetUri": "magnet:?xt=urn:btih:SD"},
+        ]})
+
+    with mock.patch("indexer_client.requests.get", side_effect=fake_get) as get:
+        c = IndexerClient("http://localhost:9117")
+        with pytest.raises(NoMagnetFound):
+            c.get_best_magnet("Show S01E01")
+        assert c.get_best_magnet("Show S01E01", fallback_categories=GENERAL_CATEGORIES) == "magnet:?xt=urn:btih:SD"
+        searched = [{v for k, v in call.kwargs["params"] if k == "Category[]"} for call in get.call_args_list]
+        assert searched[-2:] == [{"5030", "2030"}, {"5000", "2000"}]

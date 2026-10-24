@@ -29,6 +29,8 @@ logger = logging.getLogger(__name__)
 
 # Categories restricted to SD TV and SD Movies
 _DEFAULT_CATEGORIES = [5030, 2030]
+# All TV and all Movies: optional second search when the SD categories find nothing.
+GENERAL_CATEGORIES = [5000, 2000]
 
 _POSITIVE_PATTERNS = {
     r"\b480i\b": 4.0,
@@ -52,6 +54,10 @@ _NEGATIVE_PATTERNS = {
 
 class NoMagnetFound(Exception):
     """Raised when a suitable magnet link cannot be found for the query."""
+
+
+class IndexerUnavailable(Exception):
+    """Raised when no indexer answered at all (as opposed to answering with no results)."""
 
 
 class IndexerClient:
@@ -146,7 +152,7 @@ class IndexerClient:
             if results is not None:
                 return results
         logger.warning("No indexer answered at %s", self.base_url)
-        return []
+        raise IndexerUnavailable(f"No indexer answered at {self.base_url}")
 
     @staticmethod
     def _extract_field(obj: Dict[str, Any], candidates: List[str]) -> Optional[Any]:
@@ -253,21 +259,55 @@ class IndexerClient:
         ranked.sort(key=lambda r: r["score"], reverse=True)
         return ranked
 
-    def get_best_release(self, title: str, categories: Optional[List[int]] = None, min_seeders: int = 0) -> Dict[str, Any]:
+    def get_best_release(
+        self,
+        title: str,
+        categories: Optional[List[int]] = None,
+        min_seeders: int = 0,
+        exclude: Optional[List[str]] = None,
+        fallback_categories: Optional[List[int]] = None,
+    ) -> Dict[str, Any]:
+        """Best-scoring release whose link is not in ``exclude`` (links that already failed).
+        If nothing usable is found and ``fallback_categories`` is given, search those too
+        (title scoring still prefers SD releases there).
+
+        Raises NoMagnetFound, or IndexerUnavailable if the indexer did not answer."""
+        try:
+            return self._best_release(title, categories, min_seeders, exclude)
+        except NoMagnetFound:
+            if not fallback_categories:
+                raise
+            logger.info("Nothing in the SD categories for %s; searching %s", title, fallback_categories)
+            return self._best_release(title, fallback_categories, min_seeders, exclude)
+
+    def _best_release(self, title, categories, min_seeders, exclude) -> Dict[str, Any]:
         candidates = self._fetch_candidates(title, categories=categories)
         if not candidates:
             raise NoMagnetFound(f"No results returned from indexer for query: {title}")
-        ranked = self.rank_releases(candidates, min_seeders=min_seeders)
+        excluded = set(exclude or [])
+        ranked = [r for r in self.rank_releases(candidates, min_seeders=min_seeders) if r["link"] not in excluded]
         if not ranked:
+            if excluded:
+                raise NoMagnetFound(f"No untried releases left for: {title}")
             raise NoMagnetFound(f"No downloadable releases with at least {min_seeders} seeders for: {title}")
         best = ranked[0]
         logger.info("Selected release (score=%.2f, seeders=%d): %s", best["score"], best["seeders"], best["title"])
         return best
 
-    def get_best_magnet(self, title: str, categories: Optional[List[int]] = None, min_seeders: int = 0) -> str:
+    def get_best_magnet(
+        self,
+        title: str,
+        categories: Optional[List[int]] = None,
+        min_seeders: int = 0,
+        exclude: Optional[List[str]] = None,
+        fallback_categories: Optional[List[int]] = None,
+    ) -> str:
         """Return the single link (magnet or .torrent URL) that best balances
-        seeder counts and CRT-friendly titles. Raises NoMagnetFound."""
-        return self.get_best_release(title, categories=categories, min_seeders=min_seeders)["link"]
+        seeder counts and CRT-friendly titles, skipping links in ``exclude``.
+        Raises NoMagnetFound or IndexerUnavailable."""
+        return self.get_best_release(
+            title, categories=categories, min_seeders=min_seeders, exclude=exclude, fallback_categories=fallback_categories,
+        )["link"]
 
 
 if __name__ == "__main__":
@@ -280,5 +320,5 @@ if __name__ == "__main__":
     client = IndexerClient("http://localhost:9117", api_key=None)
     try:
         print(client.get_best_magnet(q))
-    except NoMagnetFound as e:
+    except (NoMagnetFound, IndexerUnavailable) as e:
         print("No magnet found:", e)
